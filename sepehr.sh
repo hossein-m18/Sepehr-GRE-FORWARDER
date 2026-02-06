@@ -632,6 +632,101 @@ uninstall_clean() {
   render
   pause_enter
 }
+
+get_gre_cidr() {
+  local id="$1"
+  ip -4 addr show dev "gre${id}" 2>/dev/null \
+    | awk '/inet /{print $2}' \
+    | head -n1
+}
+
+gre_target_ip_from_cidr() {
+  local cidr="$1"
+  local ip mask
+  ip="${cidr%/*}"
+  mask="${cidr#*/}"
+
+  valid_ipv4 "$ip" || return 1
+  [[ "$mask" == "30" ]] || return 2
+
+  IFS='.' read -r a b c d <<<"$ip"
+
+  local base_last=$(( d & 252 ))
+  local target_last=$(( base_last + 2 ))
+
+  ((target_last>=0 && target_last<=255)) || return 3
+
+  echo "${a}.${b}.${c}.${target_last}"
+  return 0
+}
+
+add_tunnel_port() {
+  local -a PORT_LIST=()
+  local id cidr target_ip
+
+  mapfile -t GRE_IDS < <(get_gre_ids)
+  local -a GRE_LABELS=()
+  local gid
+  for gid in "${GRE_IDS[@]}"; do
+    GRE_LABELS+=("GRE${gid}")
+  done
+
+  if ! menu_select_index "Add Tunnel Port" "Select GRE:" "${GRE_LABELS[@]}"; then
+    return 0
+  fi
+
+  local idx="$MENU_SELECTED"
+  id="${GRE_IDS[$idx]}"
+  add_log "GRE selected: GRE${id}"
+
+  ask_ports
+
+  cidr="$(get_gre_cidr "$id")"
+  if [[ -z "$cidr" ]]; then
+    die_soft "Cannot detect inet on gre${id}. Is gre${id} UP?"
+    return 0
+  fi
+  add_log "Detected gre${id} inet: ${cidr}"
+
+  target_ip="$(gre_target_ip_from_cidr "$cidr")"
+  local rc=$?
+  if [[ $rc -eq 2 ]]; then
+    die_soft "gre${id} mask is not /30 (found: ${cidr})."
+    return 0
+  elif [[ $rc -ne 0 || -z "$target_ip" ]]; then
+    die_soft "Failed to compute target IP from: ${cidr}"
+    return 0
+  fi
+  add_log "Target IP (network+2): ${target_ip}"
+
+  add_log "Creating forwarders for GRE${id}..."
+  local p
+  for p in "${PORT_LIST[@]}"; do
+    make_fw_service "$id" "$p" "$target_ip"
+  done
+
+  add_log "Reloading systemd..."
+  systemd_reload
+
+  add_log "Enable & Start forwarders..."
+  for p in "${PORT_LIST[@]}"; do
+    enable_now "fw-gre${id}-${p}.service"
+  done
+
+  render
+  echo "GRE${id}:"
+  echo "  inet   : ${cidr}"
+  echo "  target : ${target_ip}"
+  echo
+  echo "Status:"
+  for p in "${PORT_LIST[@]}"; do
+    echo
+    show_unit_status_brief "fw-gre${id}-${p}.service"
+  done
+  pause_enter
+}
+
+
 main_menu() {
   local choice=""
   while true; do
@@ -640,6 +735,7 @@ main_menu() {
     echo "2 > KHAREJ SETUP"
     echo "3 > Services ManageMent"
     echo "4 > Unistall & Clean"
+	echo "5 > add tunnel port"
     echo "0 > Exit"
     echo
     read -r -e -p "Select option: " choice
@@ -650,6 +746,7 @@ main_menu() {
       2) add_log "Selected: KHAREJ SETUP"; kharej_setup ;;
       3) add_log "Selected: Services ManageMent"; services_management ;;
       4) add_log "Selected: Unistall & Clean"; uninstall_clean ;;
+	  5) add_log "Selected: add tunnel port"; add_tunnel_port ;;
       0) add_log "Bye!"; render; exit 0 ;;
       *) add_log "Invalid option: $choice" ;;
     esac
