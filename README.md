@@ -8,12 +8,12 @@
 
 Socat Forwarder
 
-      wget https://raw.githubusercontent.com/ToolSeRF/Sepehr-GRE-FORWARDER/refs/heads/main/sepehr.sh && chmod +x sepehr.sh && bash sepehr.sh
+    wget https://raw.githubusercontent.com/ToolSeRF/Sepehr-GRE-FORWARDER/refs/heads/main/sepehr.sh && chmod +x sepehr.sh && bash sepehr.sh
 
 
 HAProxy Forwarder
 
-      wget https://raw.githubusercontent.com/ToolSeRF/Sepehr-GRE-FORWARDER/refs/heads/main/sepehr-haproxy.sh && chmod +x sepehr-haproxy.sh && bash sepehr-haproxy.sh
+    wget https://raw.githubusercontent.com/ToolSeRF/Sepehr-GRE-FORWARDER/refs/heads/main/sepehr-haproxy.sh && chmod +x sepehr-haproxy.sh && bash sepehr-haproxy.sh
 
 ## 🧭 ساختار منو
 
@@ -42,7 +42,7 @@ HAProxy Forwarder
 
 بعد از انجام مراحل تانلینگ با دستور
 
-ls -la /etc/systemd/system | grep -E 'gre[0-9]+\.service|fw-gre' 
+    ls -la /etc/systemd/system | grep -E 'gre[0-9]+\.service|fw-gre' 
 
 لیست سرویس های ساخته شده رو دریافت کنید.
 
