@@ -699,6 +699,139 @@ uninstall_clean() {
   pause_enter
 }
 
+get_gre_local_ip_cidr() {
+  local id="$1"
+  ip -4 -o addr show dev "gre${id}" 2>/dev/null | awk '{print $4}' | head -n1
+}
+
+get_peer_ip_from_local_cidr() {
+  local cidr="$1"
+  local ip="${cidr%/*}"
+  local mask="${cidr#*/}"
+
+  IFS='.' read -r a b c d <<<"$ip"
+
+  local peer_d
+  if [[ "$d" == "1" ]]; then
+    peer_d="2"
+  elif [[ "$d" == "2" ]]; then
+    peer_d="1"
+  else
+    peer_d="2"
+  fi
+
+  echo "${a}.${b}.${c}.${peer_d}"
+}
+
+haproxy_add_ports_to_gre_cfg() {
+  local id="$1" target_ip="$2"
+  shift 2
+  local -a ports=("$@")
+  local cfg="/etc/haproxy/conf.d/haproxy-gre${id}.cfg"
+
+  if [[ ! -f "$cfg" ]]; then
+    add_log "ERROR: Not found: $cfg"
+    return 1
+  fi
+
+  add_log "Editing HAProxy config: $cfg"
+  render
+
+  local p added=0 skipped=0
+  for p in "${ports[@]}"; do
+    if grep -qE "^frontend[[:space:]]+gre${id}_fe_${p}\b" "$cfg" 2>/dev/null; then
+      add_log "Skip (exists): GRE${id} port ${p}"
+      ((skipped++))
+      continue
+    fi
+
+    cat >>"$cfg" <<EOF
+
+frontend gre${id}_fe_${p}
+    bind 0.0.0.0:${p}
+    default_backend gre${id}_be_${p}
+
+backend gre${id}_be_${p}
+    option tcp-check
+    server gre${id}_b_${p} ${target_ip}:${p} check
+EOF
+
+    add_log "Added: GRE${id} port ${p} -> ${target_ip}:${p}"
+    ((added++))
+  done
+
+  add_log "Done. Added=${added}, Skipped=${skipped}"
+  return 0
+}
+
+add_tunnel_port() {
+  render
+  add_log "Selected: add tunnel port"
+  render
+
+  mapfile -t GRE_IDS < <(get_gre_ids)
+  local -a GRE_LABELS=()
+  local id
+  for id in "${GRE_IDS[@]}"; do
+    GRE_LABELS+=("GRE${id}")
+  done
+
+  if ! menu_select_index "Add Tunnel Port" "Select GRE:" "${GRE_LABELS[@]}"; then
+    return 0
+  fi
+
+  local idx="$MENU_SELECTED"
+  id="${GRE_IDS[$idx]}"
+  add_log "GRE selected: GRE${id}"
+  render
+
+  local cidr
+  cidr="$(get_gre_local_ip_cidr "$id")"
+  if [[ -z "$cidr" ]]; then
+    die_soft "Could not detect IP on gre${id}. Is it up and has an IP?"
+    return 0
+  fi
+
+  local peer_ip
+  peer_ip="$(get_peer_ip_from_local_cidr "$cidr")"
+  add_log "Detected: gre${id} local=${cidr} | peer=${peer_ip}"
+  render
+
+  PORT_LIST=()
+  ask_ports
+
+  haproxy_add_ports_to_gre_cfg "$id" "$peer_ip" "${PORT_LIST[@]}" || { die_soft "Failed editing haproxy-gre${id}.cfg"; return 0; }
+
+  if command -v haproxy >/dev/null 2>&1; then
+    haproxy -c -f /etc/haproxy/haproxy.cfg -f /etc/haproxy/conf.d/ >/dev/null 2>&1
+    if [[ $? -ne 0 ]]; then
+      die_soft "HAProxy config validation failed (haproxy -c)."
+      return 0
+    fi
+  fi
+
+  if haproxy_unit_exists; then
+    add_log "Restarting HAProxy..."
+    render
+    systemctl restart haproxy >/dev/null 2>&1 || true
+    add_log "HAProxy restarted."
+  else
+    add_log "WARNING: haproxy.service not found; skipped restart."
+  fi
+
+  render
+  echo "GRE${id} updated."
+  echo "Local CIDR : ${cidr}"
+  echo "Peer IP    : ${peer_ip}"
+  echo "Ports added: ${PORT_LIST[*]}"
+  echo
+  echo "---- STATUS (haproxy.service) ----"
+  systemctl status haproxy --no-pager 2>&1 | sed -n '1,16p'
+  echo "---------------------------------"
+  pause_enter
+}
+
+
 main_menu() {
   local choice=""
   while true; do
@@ -707,6 +840,7 @@ main_menu() {
     echo "2 > KHAREJ SETUP"
     echo "3 > Services ManageMent"
     echo "4 > Unistall & Clean"
+	echo "5 > add tunnel port"
     echo "0 > Exit"
     echo
     read -r -e -p "Select option: " choice
@@ -717,6 +851,7 @@ main_menu() {
       2) add_log "Selected: KHAREJ SETUP"; kharej_setup ;;
       3) add_log "Selected: Services ManageMent"; services_management ;;
       4) add_log "Selected: Unistall & Clean"; uninstall_clean ;;
+	  5) add_log "Selected: add tunnel port"; add_tunnel_port ;;
       0) add_log "Bye!"; render; exit 0 ;;
       *) add_log "Invalid option: $choice" ;;
     esac
