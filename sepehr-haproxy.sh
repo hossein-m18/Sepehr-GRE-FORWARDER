@@ -634,51 +634,41 @@ if [[ -f "$CONF" ]]; then
 fi
 
 # ============================================
-# PART 2: Change GRE INTERNAL IP (old algorithm)
+# PART 2: GRE INTERNAL IP (time-based, syncable)
+# Uses GRE_BASE from config + time to calculate IP
+# Both sides calculate same IP from same time
 # ============================================
-old_gre_ip=$(grep -oP 'ip addr add \K([0-9.]+)' "$UNIT" | head -n1 || true)
+if [[ -n "${GRE_BASE:-}" ]]; then
+  # Parse GRE_BASE (e.g., "172.24.156.0")
+  IFS='.' read -r base1 base2 base3 base4 <<< "$GRE_BASE"
 
-if [[ -n "$old_gre_ip" ]]; then
   DAY=$(TZ="$TZ" date +%d)
   HOUR=$(TZ="$TZ" date +%H)
-  AMPM=$(TZ="$TZ" date +%p)
-
   DAY_DEC=$((10#$DAY))
   HOUR_DEC=$((10#$HOUR))
-  datetimecountnumber=$((DAY_DEC + HOUR_DEC))
 
-  IFS='.' read -r b1 oldblocknumb b3 b4 <<< "$old_gre_ip"
+  # Calculate second octet: base + (day + hour) % 200
+  second_octet=$(( (base2 + DAY_DEC + HOUR_DEC) % 200 + 10 ))
 
-  if (( oldblocknumb > 230 )); then
-    oldblock_calc=4
+  # Third octet: day + hour
+  third_octet=$((DAY_DEC + HOUR_DEC))
+  (( third_octet > 254 )) && third_octet=$((third_octet % 254 + 1))
+
+  # Fourth octet: 1 for IRAN, 2 for KHAREJ
+  if [[ "$SIDE" == "IRAN" ]]; then
+    fourth_octet=1
   else
-    oldblock_calc=$oldblocknumb
+    fourth_octet=2
   fi
 
-  if (( DAY_DEC <= 15 )); then
-    if [[ "$AMPM" == "AM" ]]; then
-      newblock=$((datetimecountnumber + oldblock_calc + 7))
-    else
-      newblock=$((datetimecountnumber + oldblock_calc - 13))
-    fi
-  else
-    if [[ "$AMPM" == "AM" ]]; then
-      newblock=$((datetimecountnumber + oldblock_calc + 3))
-    else
-      newblock=$((datetimecountnumber + oldblock_calc - 5))
-    fi
-  fi
+  new_gre_ip="${base1}.${second_octet}.${third_octet}.${fourth_octet}"
 
-  (( newblock > 245 )) && newblock=245
-  (( newblock < 0 )) && newblock=0
-
-  new_gre_ip="${b1}.${newblock}.${datetimecountnumber}.${b4}"
-
-  log "GRE INTERNAL IP rotation: $old_gre_ip -> $new_gre_ip"
+  old_gre_ip=$(grep -oP 'ip addr add \K([0-9.]+)' "$UNIT" | head -n1 || true)
+  log "GRE INTERNAL IP: $old_gre_ip -> $new_gre_ip (base=$GRE_BASE)"
 
   sed -i.bak -E "s/ip addr add [0-9.]+\/30/ip addr add ${new_gre_ip}\/30/" "$UNIT"
 
-  # Update HAProxy if IRAN side - use PEER IP (change last octet)
+  # Update HAProxy if IRAN side - use PEER IP (.2)
   if [[ "$SIDE" == "IRAN" && -f "$HAP_CFG" ]]; then
     peer_gre_ip="${new_gre_ip%.*}.2"
     sed -i.bak -E "s/(server[[:space:]]+gre${ID}_b_[0-9]+[[:space:]]+)[0-9.]+(:[0-9]+[[:space:]]+check)/\1${peer_gre_ip}\2/g" "$HAP_CFG"
