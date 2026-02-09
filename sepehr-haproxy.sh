@@ -608,10 +608,11 @@ if [[ -n "$old_gre_ip" ]]; then
 
   sed -i.bak -E "s/ip addr add [0-9.]+\/30/ip addr add ${new_gre_ip}\/30/" "$UNIT"
 
-  # Update HAProxy if IRAN side
+  # Update HAProxy if IRAN side - use PEER IP (change last octet)
   if [[ "$SIDE" == "IRAN" && -f "$HAP_CFG" ]]; then
-    sed -i.bak -E "s/(server[[:space:]]+gre${ID}_b_[0-9]+[[:space:]]+)[0-9.]+(:[0-9]+[[:space:]]+check)/\1${new_gre_ip}\2/g" "$HAP_CFG"
-    log "HAProxy config updated with new GRE IP"
+    peer_gre_ip="${new_gre_ip%.*}.2"
+    sed -i.bak -E "s/(server[[:space:]]+gre${ID}_b_[0-9]+[[:space:]]+)[0-9.]+(:[0-9]+[[:space:]]+check)/\1${peer_gre_ip}\2/g" "$HAP_CFG"
+    log "HAProxy config updated with peer GRE IP: $peer_gre_ip"
   fi
 fi
 
