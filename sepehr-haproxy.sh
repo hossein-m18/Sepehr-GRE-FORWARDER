@@ -512,8 +512,9 @@ reset_fail_count() {
 
 create_auto_cron() {
   local id="$1" side="$2"
+  # Default to every 30 minutes if not specified
+  local cron_line="${3:-*/30 * * * *}"
   local script="/usr/local/bin/sepehr-recreate-gre${id}.sh"
-  local cron_line="*/30 * * * * ${script}"
 
   # Always recreate script to ensure it has latest logic
   cat > "$script" <<'ROTATION_SCRIPT'
@@ -642,13 +643,9 @@ ROTATION_SCRIPT
   sed -i "s|__SIDE__|${side}|g" "$script"
   chmod +x "$script"
 
-  # Add cron if not exists
-  if ! crontab -l 2>/dev/null | grep -qF "$script"; then
-    (crontab -l 2>/dev/null || true; echo "$cron_line") | crontab -
-    add_log "Auto-cron enabled: every 30 minutes"
-  else
-    add_log "Auto-cron already exists for GRE${id}"
-  fi
+  # Update cron: remove old, add new
+  (crontab -l 2>/dev/null | grep -vF "$script" || true; echo "$cron_line $script") | crontab -
+  add_log "Auto-cron set for GRE${id}: $cron_line"
 
   return 0
 }
@@ -1509,87 +1506,16 @@ recreate_automation() {
     add_log "Invalid time value"
   done
 
-  script="/usr/local/bin/sepehr-recreate-gre${id}.sh"
-
-  cat > "$script" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-
-ID="${id}"
-SIDE="${side}"
-CONF="/etc/sepehr/gre\${ID}.conf"
-UNIT="/etc/systemd/system/gre\${ID}.service"
-LOG_FILE="/var/log/sepehr-gre\${ID}.log"
-TZ="Asia/Tehran"
-
-mkdir -p /var/log >/dev/null 2>&1 || true
-touch "\$LOG_FILE" >/dev/null 2>&1 || true
-
-log() { echo "[\$(TZ="\$TZ" date '+%Y-%m-%d %H:%M %Z')] \$1" >> "\$LOG_FILE"; }
-
-# Check if multi-IP config exists
-if [[ -f "\$CONF" ]]; then
-  log "Using multi-IP config: \$CONF"
-  source "\$CONF"
-
-  IFS=',' read -r -a local_arr <<< "\$LOCAL_IPS"
-  IFS=',' read -r -a remote_arr <<< "\$REMOTE_IPS"
-
-  day=\$(TZ="Asia/Tehran" date +%d)
-  hour=\$(TZ="Asia/Tehran" date +%H)
-  offset=\${OFFSET:-0}
-
-  index_local=\$(( (10#\$day + 10#\$hour + offset) % \${#local_arr[@]} ))
-  index_remote=\$(( (10#\$day + 10#\$hour + offset) % \${#remote_arr[@]} ))
-
-  NEW_LOCAL="\${local_arr[\$index_local]}"
-  NEW_REMOTE="\${remote_arr[\$index_remote]}"
-
-  log "Calculated IPs: Local=\$NEW_LOCAL Remote=\$NEW_REMOTE (offset=\$offset)"
-
-  if [[ -f "\$UNIT" ]]; then
-    sed -i -E "s/(ip tunnel add gre\$ID mode gre local )[0-9.]+/\1\$NEW_LOCAL/" "\$UNIT"
-    sed -i -E "s/(remote )[0-9.]+ (ttl)/\1\$NEW_REMOTE \2/" "\$UNIT"
-    log "Updated service file with new IPs"
-  fi
-
-  sed -i "s/^FAIL_COUNT=.*/FAIL_COUNT=0/" "\$CONF"
-  sed -i "s/^LAST_SUCCESS=.*/LAST_SUCCESS=\$(date +%s)/" "\$CONF"
-
-else
-  log "No multi-IP config found, using legacy backup mode"
-  BACKUP_DIR="/root/gre-backup"
-  GRE_BAK="\$BACKUP_DIR/gre\${ID}.service"
-
-  if [[ -f "\$GRE_BAK" ]]; then
-    cp -a "\$GRE_BAK" "\$UNIT"
-    log "Restored from backup: \$GRE_BAK"
-  fi
-fi
-
-systemctl daemon-reload >/dev/null 2>&1 || true
-systemctl restart "gre\${ID}.service" >/dev/null 2>&1 || true
-
-if [[ "\$SIDE" == "IRAN" ]]; then
-  systemctl restart haproxy >/dev/null 2>&1 || true
-  log "HAProxy restarted"
-fi
-
-log "Rotation OK | GRE\${ID} | SIDE=\$SIDE"
-EOF
-
-  chmod +x "$script"
-
   if [[ "$mode" == "1" ]]; then
-    cron_line="0 */${val} * * * ${script}"
+    cron_line="0 */${val} * * * "
   else
-    cron_line="*/${val} * * * * ${script}"
+    cron_line="*/${val} * * * * "
   fi
 
-  (crontab -l 2>/dev/null | grep -vF "$script" || true; echo "$cron_line") | crontab -
+  # Call centralized function
+  create_auto_cron "$id" "$side" "$cron_line"
 
-  add_log "Automation Regenerate for GRE${id}"
-  add_log "Script: ${script}"
+  add_log "Automation Regenerated for GRE${id}"
   add_log "Log   : /var/log/sepehr-gre${id}.log"
   add_log "Cron  : ${cron_line}"
   pause_enter
@@ -2005,8 +1931,12 @@ create_monitor_service() {
   local peer_gre_ip
   if [[ "$SIDE" == "IRAN" ]]; then
     peer_gre_ip="$(ipv4_set_last_octet "$GRE_BASE" 2)"
+    # Ensure rotation script exists (default 30min)
+    create_auto_cron "$id" "IRAN"
   else
     peer_gre_ip="$(ipv4_set_last_octet "$GRE_BASE" 1)"
+    # Ensure rotation script exists (default 30min)
+    create_auto_cron "$id" "KHAREJ"
   fi
 
   add_log "Creating monitor script: $script"
@@ -2046,42 +1976,26 @@ if ((NEW_FAIL >= MAX_FAILS)); then
   # Trigger failover
   log "MAX FAILS reached - triggering IP rotation"
 
+  # Reset fail count
+  sed -i "s/^FAIL_COUNT=.*/FAIL_COUNT=0/" "$CONF"
+
+  # Increment OFFSET (for GRE internal IP rotation)
   source "$CONF"
   NEW_OFFSET=$((OFFSET + 1))
   sed -i "s/^OFFSET=.*/OFFSET=${NEW_OFFSET}/" "$CONF"
-  sed -i "s/^FAIL_COUNT=.*/FAIL_COUNT=0/" "$CONF"
+  log "OFFSET incremented to $NEW_OFFSET"
 
-  # Recalculate IPs
-  source "$CONF"
-  IFS=',' read -r -a local_arr <<< "$LOCAL_IPS"
-  IFS=',' read -r -a remote_arr <<< "$REMOTE_IPS"
+  # CALL THE CENTRALIZED ROTATION SCRIPT
+  # This ensures monitor uses the exact same logic as cron (Public IPs time-based, GRE IPs offset-based)
+  ROTATION_SCRIPT="/usr/local/bin/sepehr-recreate-gre${ID}.sh"
 
-  day=$(TZ="Asia/Tehran" date +%d)
-  hour=$(TZ="Asia/Tehran" date +%H)
-
-  index_local=$(( (10#$day + 10#$hour + NEW_OFFSET) % ${#local_arr[@]} ))
-  index_remote=$(( (10#$day + 10#$hour + NEW_OFFSET) % ${#remote_arr[@]} ))
-
-  NEW_LOCAL="${local_arr[$index_local]}"
-  NEW_REMOTE="${remote_arr[$index_remote]}"
-
-  log "New IPs: Local=$NEW_LOCAL Remote=$NEW_REMOTE (offset=$NEW_OFFSET)"
-
-  # Apply to service file
-  UNIT="/etc/systemd/system/gre$ID.service"
-  if [[ -f "$UNIT" ]]; then
-    sed -i -E "s/(ip tunnel add gre$ID mode gre local )[0-9.]+/\1$NEW_LOCAL/" "$UNIT"
-    sed -i -E "s/(remote )[0-9.]+ (ttl)/\1$NEW_REMOTE \2/" "$UNIT"
-
-    systemctl daemon-reload
-    systemctl restart "gre$ID.service"
-    log "GRE$ID restarted with new IPs"
-
-    # Restart haproxy if IRAN side
-    if [[ "$SIDE" == "IRAN" ]]; then
-      systemctl restart haproxy 2>/dev/null || true
-      log "HAProxy restarted"
-    fi
+  if [[ -f "$ROTATION_SCRIPT" ]]; then
+    log "Executing rotation script: $ROTATION_SCRIPT"
+    bash "$ROTATION_SCRIPT" >> "$LOG_FILE" 2>&1
+  else
+    log "ERROR: Rotation script not found: $ROTATION_SCRIPT"
+    # Fallback: simple restart
+    systemctl restart "gre${ID}.service"
   fi
 fi
 MONITOR_SCRIPT
