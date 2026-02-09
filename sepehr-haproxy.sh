@@ -131,7 +131,13 @@ get_server_ips() {
   local -a ips=()
   local ip
   while IFS= read -r ip; do
-    [[ -n "$ip" ]] && ips+=("$ip")
+    [[ -z "$ip" ]] && continue
+    # Skip private IP ranges (10.x.x.x, 172.16-31.x.x, 192.168.x.x, 127.x.x.x)
+    [[ "$ip" =~ ^10\. ]] && continue
+    [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]] && continue
+    [[ "$ip" =~ ^192\.168\. ]] && continue
+    [[ "$ip" =~ ^127\. ]] && continue
+    ips+=("$ip")
   done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d'/' -f1 | sort -u)
   printf '%s\n' "${ips[@]}"
 }
@@ -291,6 +297,7 @@ ask_multiple_local_ips() {
     echo
     echo "Selected: ${SELECTED_IPS[*]:-none}"
     echo
+    echo "a) Select ALL IPs"
     echo "0) Enter IP manually"
     echo "d) Done selecting"
     echo
@@ -298,6 +305,13 @@ ask_multiple_local_ips() {
     local choice
     read -r -e -p "Select: " choice
     choice="$(trim "$choice")"
+
+    if [[ "${choice,,}" == "a" || "${choice,,}" == "all" ]]; then
+      # Select all server IPs
+      SELECTED_IPS=("${SERVER_IPS[@]}")
+      add_log "Selected ALL IPs: ${SELECTED_IPS[*]}"
+      continue
+    fi
 
     if [[ "${choice,,}" == "d" || "${choice,,}" == "done" ]]; then
       if ((${#SELECTED_IPS[@]} == 0)); then
@@ -409,6 +423,14 @@ write_sepehr_conf() {
 
   ensure_sepehr_conf_dir
 
+  # Calculate total paths (local_count × remote_count)
+  local local_count remote_count total_paths
+  IFS=',' read -ra tmp_local <<< "$local_ips"
+  IFS=',' read -ra tmp_remote <<< "$remote_ips"
+  local_count=${#tmp_local[@]}
+  remote_count=${#tmp_remote[@]}
+  total_paths=$((local_count * remote_count))
+
   cat >"$conf" <<EOF
 # Sepehr GRE${id} Configuration
 # Generated: $(date '+%Y-%m-%d %H:%M:%S')
@@ -417,12 +439,13 @@ LOCAL_IPS="${local_ips}"
 REMOTE_IPS="${remote_ips}"
 GRE_BASE="${gre_base}"
 MTU="${mtu}"
-OFFSET=0
+TOTAL_PATHS=${total_paths}
+BLACKLIST=""
 FAIL_COUNT=0
 LAST_SUCCESS=$(date +%s)
 EOF
 
-  add_log "Config written: $conf"
+  add_log "Config written: $conf (${total_paths} paths)"
   return 0
 }
 
@@ -536,9 +559,9 @@ log() { echo "[$(TZ="$TZ" date '+%Y-%m-%d %H:%M %Z')] $1" >> "$LOG_FILE"; }
 [[ -f "$UNIT" ]] || { log "ERROR: Unit not found: $UNIT"; exit 1; }
 
 # ============================================
-# PART 1: Change PUBLIC IPs (multi-IP system)
-# NOTE: NO OFFSET used here! Both sides must select same IPs.
-# Only DAY+HOUR is used so both sides are always in sync.
+# PART 1: PATH-BASED PUBLIC IP SELECTION
+# Both sides select same path using DAY+HOUR
+# Blacklisted paths are skipped
 # ============================================
 if [[ -f "$CONF" ]]; then
   source "$CONF"
@@ -546,17 +569,62 @@ if [[ -f "$CONF" ]]; then
   IFS=',' read -r -a local_arr <<< "$LOCAL_IPS"
   IFS=',' read -r -a remote_arr <<< "$REMOTE_IPS"
 
+  local_count=${#local_arr[@]}
+  remote_count=${#remote_arr[@]}
+  total_paths=$((local_count * remote_count))
+
+  # Parse blacklist into array
+  declare -a blacklist=()
+  if [[ -n "${BLACKLIST:-}" ]]; then
+    IFS=',' read -r -a blacklist <<< "$BLACKLIST"
+  fi
+
+  # Function to check if path is blacklisted
+  is_blacklisted() {
+    local p=$1
+    for b in "${blacklist[@]}"; do
+      [[ "$b" == "$p" ]] && return 0
+    done
+    return 1
+  }
+
+  # Count active paths
+  active_count=0
+  for ((p=0; p<total_paths; p++)); do
+    is_blacklisted "$p" || ((active_count++))
+  done
+
+  # If all paths blacklisted, reset blacklist
+  if ((active_count == 0)); then
+    log "All paths blacklisted - resetting"
+    sed -i 's/^BLACKLIST=.*/BLACKLIST=""/' "$CONF"
+    blacklist=()
+    active_count=$total_paths
+  fi
+
+  # Calculate base index from time (synchronized across servers)
   day=$(TZ="Asia/Tehran" date +%d)
   hour=$(TZ="Asia/Tehran" date +%H)
+  base_index=$(( (10#$day + 10#$hour) % total_paths ))
 
-  # NO OFFSET for public IPs - ensures both sides select same IPs
-  index_local=$(( (10#$day + 10#$hour) % ${#local_arr[@]} ))
-  index_remote=$(( (10#$day + 10#$hour) % ${#remote_arr[@]} ))
+  # Find next active path starting from base_index
+  path_index=$base_index
+  for ((i=0; i<total_paths; i++)); do
+    if ! is_blacklisted "$path_index"; then
+      break
+    fi
+    path_index=$(( (path_index + 1) % total_paths ))
+  done
 
-  NEW_LOCAL="${local_arr[$index_local]}"
-  NEW_REMOTE="${remote_arr[$index_remote]}"
+  # Calculate local and remote indices from path_index
+  # path = local_idx * remote_count + remote_idx
+  local_idx=$((path_index / remote_count))
+  remote_idx=$((path_index % remote_count))
 
-  log "PUBLIC IP rotation: Local=$NEW_LOCAL Remote=$NEW_REMOTE (day=$day hour=$hour)"
+  NEW_LOCAL="${local_arr[$local_idx]}"
+  NEW_REMOTE="${remote_arr[$remote_idx]}"
+
+  log "PATH $path_index: Local=$NEW_LOCAL Remote=$NEW_REMOTE (active=$active_count/${total_paths})"
 
   sed -i -E "s/(ip tunnel add gre$ID mode gre local )[0-9.]+/\1$NEW_LOCAL/" "$UNIT"
   sed -i -E "s/(remote )[0-9.]+ (ttl)/\1$NEW_REMOTE \2/" "$UNIT"
@@ -1465,7 +1533,7 @@ select_and_set_timezone() {
 
 
 recreate_automation() {
-  local id side mode val script cron_line
+  local id side
 
   mapfile -t GRE_IDS < <(get_gre_ids)
   local -a GRE_LABELS=()
@@ -1489,109 +1557,20 @@ recreate_automation() {
       *) add_log "Invalid side" ;;
     esac
   done
+
+  # Update SIDE in config
+  local conf
+  conf="$(sepehr_conf_path "$id")"
+  if [[ -f "$conf" ]]; then
+    sed -i "s/^SIDE=.*/SIDE=\"${side}\"/" "$conf"
+  fi
+
   select_and_set_timezone || { die_soft "Timezone/NTP setup failed."; return 0; }
-  while true; do
-    render
-    echo "Time Mode"
-    echo "1) Hourly time (1-12)"
-    echo "2) Minute time (15-45)"
-    echo
-    read -r -p "Select: " mode
-    [[ "$mode" == "1" || "$mode" == "2" ]] && break
-    add_log "Invalid mode"
-  done
 
-  while true; do
-    render
-    read -r -p "how much time set for cron? " val
-    if [[ "$mode" == "1" && "$val" =~ ^([1-9]|1[0-2])$ ]]; then break; fi
-    if [[ "$mode" == "2" && "$val" =~ ^(1[5-9]|[2-3][0-9]|4[0-5])$ ]]; then break; fi
-    add_log "Invalid time value"
-  done
+  # Use unified create_auto_cron function
+  create_auto_cron "$id" "$side"
 
-  script="/usr/local/bin/sepehr-recreate-gre${id}.sh"
-
-  cat > "$script" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-
-ID="${id}"
-SIDE="${side}"
-CONF="/etc/sepehr/gre\${ID}.conf"
-UNIT="/etc/systemd/system/gre\${ID}.service"
-LOG_FILE="/var/log/sepehr-gre\${ID}.log"
-TZ="Asia/Tehran"
-
-mkdir -p /var/log >/dev/null 2>&1 || true
-touch "\$LOG_FILE" >/dev/null 2>&1 || true
-
-log() { echo "[\$(TZ="\$TZ" date '+%Y-%m-%d %H:%M %Z')] \$1" >> "\$LOG_FILE"; }
-
-# Check if multi-IP config exists
-if [[ -f "\$CONF" ]]; then
-  log "Using multi-IP config: \$CONF"
-  source "\$CONF"
-
-  IFS=',' read -r -a local_arr <<< "\$LOCAL_IPS"
-  IFS=',' read -r -a remote_arr <<< "\$REMOTE_IPS"
-
-  day=\$(TZ="Asia/Tehran" date +%d)
-  hour=\$(TZ="Asia/Tehran" date +%H)
-  offset=\${OFFSET:-0}
-
-  index_local=\$(( (10#\$day + 10#\$hour + offset) % \${#local_arr[@]} ))
-  index_remote=\$(( (10#\$day + 10#\$hour + offset) % \${#remote_arr[@]} ))
-
-  NEW_LOCAL="\${local_arr[\$index_local]}"
-  NEW_REMOTE="\${remote_arr[\$index_remote]}"
-
-  log "Calculated IPs: Local=\$NEW_LOCAL Remote=\$NEW_REMOTE (offset=\$offset)"
-
-  if [[ -f "\$UNIT" ]]; then
-    sed -i -E "s/(ip tunnel add gre\$ID mode gre local )[0-9.]+/\1\$NEW_LOCAL/" "\$UNIT"
-    sed -i -E "s/(remote )[0-9.]+ (ttl)/\1\$NEW_REMOTE \2/" "\$UNIT"
-    log "Updated service file with new IPs"
-  fi
-
-  sed -i "s/^FAIL_COUNT=.*/FAIL_COUNT=0/" "\$CONF"
-  sed -i "s/^LAST_SUCCESS=.*/LAST_SUCCESS=\$(date +%s)/" "\$CONF"
-
-else
-  log "No multi-IP config found, using legacy backup mode"
-  BACKUP_DIR="/root/gre-backup"
-  GRE_BAK="\$BACKUP_DIR/gre\${ID}.service"
-
-  if [[ -f "\$GRE_BAK" ]]; then
-    cp -a "\$GRE_BAK" "\$UNIT"
-    log "Restored from backup: \$GRE_BAK"
-  fi
-fi
-
-systemctl daemon-reload >/dev/null 2>&1 || true
-systemctl restart "gre\${ID}.service" >/dev/null 2>&1 || true
-
-if [[ "\$SIDE" == "IRAN" ]]; then
-  systemctl restart haproxy >/dev/null 2>&1 || true
-  log "HAProxy restarted"
-fi
-
-log "Rotation OK | GRE\${ID} | SIDE=\$SIDE"
-EOF
-
-  chmod +x "$script"
-
-  if [[ "$mode" == "1" ]]; then
-    cron_line="0 */${val} * * * ${script}"
-  else
-    cron_line="*/${val} * * * * ${script}"
-  fi
-
-  (crontab -l 2>/dev/null | grep -vF "$script" || true; echo "$cron_line") | crontab -
-
-  add_log "Automation Regenerate for GRE${id}"
-  add_log "Script: ${script}"
-  add_log "Log   : /var/log/sepehr-gre${id}.log"
-  add_log "Cron  : ${cron_line}"
+  add_log "Automation Regenerated for GRE${id}"
   pause_enter
 }
 
@@ -1656,7 +1635,7 @@ remove_gre_automation_backups() {
 
 
 recreate_automation_mode() {
-  local id side mode val script cron_line
+  local id side
 
   mapfile -t GRE_IDS < <(get_gre_ids)
   local -a GRE_LABELS=()
@@ -1681,111 +1660,19 @@ recreate_automation_mode() {
     esac
   done
 
+  # Update SIDE in config
+  local conf
+  conf="$(sepehr_conf_path "$id")"
+  if [[ -f "$conf" ]]; then
+    sed -i "s/^SIDE=.*/SIDE=\"${side}\"/" "$conf"
+  fi
+
   select_and_set_timezone || { die_soft "Timezone/NTP setup failed."; return 0; }
 
-  while true; do
-    render
-    echo "Time Mode"
-    echo "1) Hourly time (1-12)"
-    echo "2) Minute time (15-45)"
-    echo
-    read -r -p "Select: " mode
-    [[ "$mode" == "1" || "$mode" == "2" ]] && break
-    add_log "Invalid mode"
-  done
-
-  while true; do
-    render
-    read -r -p "how much time set for cron? " val
-    if [[ "$mode" == "1" && "$val" =~ ^([1-9]|1[0-2])$ ]]; then break; fi
-    if [[ "$mode" == "2" && "$val" =~ ^(1[5-9]|[2-3][0-9]|4[0-5])$ ]]; then break; fi
-    add_log "Invalid time value"
-  done
-
-  script="/usr/local/bin/sepehr-recreate-gre${id}.sh"
-
-  cat > "$script" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-
-ID="${id}"
-SIDE="${side}"
-CONF="/etc/sepehr/gre\${ID}.conf"
-UNIT="/etc/systemd/system/gre\${ID}.service"
-LOG_FILE="/var/log/sepehr-gre\${ID}.log"
-TZ="Asia/Tehran"
-
-mkdir -p /var/log >/dev/null 2>&1 || true
-touch "\$LOG_FILE" >/dev/null 2>&1 || true
-
-log() { echo "[\$(TZ="\$TZ" date '+%Y-%m-%d %H:%M %Z')] \$1" >> "\$LOG_FILE"; }
-
-# Check if multi-IP config exists
-if [[ -f "\$CONF" ]]; then
-  log "Using multi-IP config: \$CONF"
-  source "\$CONF"
-
-  IFS=',' read -r -a local_arr <<< "\$LOCAL_IPS"
-  IFS=',' read -r -a remote_arr <<< "\$REMOTE_IPS"
-
-  day=\$(TZ="Asia/Tehran" date +%d)
-  hour=\$(TZ="Asia/Tehran" date +%H)
-  offset=\${OFFSET:-0}
-
-  index_local=\$(( (10#\$day + 10#\$hour + offset) % \${#local_arr[@]} ))
-  index_remote=\$(( (10#\$day + 10#\$hour + offset) % \${#remote_arr[@]} ))
-
-  NEW_LOCAL="\${local_arr[\$index_local]}"
-  NEW_REMOTE="\${remote_arr[\$index_remote]}"
-
-  log "Calculated IPs: Local=\$NEW_LOCAL Remote=\$NEW_REMOTE (offset=\$offset)"
-
-  if [[ -f "\$UNIT" ]]; then
-    sed -i -E "s/(ip tunnel add gre\$ID mode gre local )[0-9.]+/\1\$NEW_LOCAL/" "\$UNIT"
-    sed -i -E "s/(remote )[0-9.]+ (ttl)/\1\$NEW_REMOTE \2/" "\$UNIT"
-    log "Updated service file with new IPs"
-  fi
-
-  sed -i "s/^FAIL_COUNT=.*/FAIL_COUNT=0/" "\$CONF"
-  sed -i "s/^LAST_SUCCESS=.*/LAST_SUCCESS=\$(date +%s)/" "\$CONF"
-
-else
-  log "No multi-IP config found, using legacy backup mode"
-  BACKUP_DIR="/root/gre-backup"
-  GRE_BAK="\$BACKUP_DIR/gre\${ID}.service"
-
-  if [[ -f "\$GRE_BAK" ]]; then
-    cp -a "\$GRE_BAK" "\$UNIT"
-    log "Restored from backup: \$GRE_BAK"
-  fi
-fi
-
-systemctl daemon-reload >/dev/null 2>&1 || true
-systemctl restart "gre\${ID}.service" >/dev/null 2>&1 || true
-
-if [[ "\$SIDE" == "IRAN" ]]; then
-  systemctl restart haproxy >/dev/null 2>&1 || true
-  log "HAProxy restarted"
-fi
-
-log "Rotation OK | GRE\${ID} | SIDE=\$SIDE"
-EOF
-
-  chmod +x "$script"
-
-  if [[ "$mode" == "1" ]]; then
-    cron_line="0 */${val} * * * ${script}"
-  else
-    cron_line="*/${val} * * * * ${script}"
-  fi
-
-  (crontab -l 2>/dev/null | grep -vF "$script" || true; echo "$cron_line") | crontab -
+  # Use unified create_auto_cron function
+  create_auto_cron "$id" "$side"
 
   add_log "Automation Rebuild for GRE${id}"
-  add_log "Script: ${script}"
-  add_log "Backup: /root/gre-backup/"
-  add_log "Log   : /var/log/sepehr-gre${id}.log"
-  add_log "Cron  : ${cron_line}"
   pause_enter
 }
 
@@ -2001,14 +1888,6 @@ create_monitor_service() {
     return 1
   fi
 
-  source "$conf"
-  local peer_gre_ip
-  if [[ "$SIDE" == "IRAN" ]]; then
-    peer_gre_ip="$(ipv4_set_last_octet "$GRE_BASE" 2)"
-  else
-    peer_gre_ip="$(ipv4_set_last_octet "$GRE_BASE" 1)"
-  fi
-
   add_log "Creating monitor script: $script"
   cat >"$script" <<'MONITOR_SCRIPT'
 #!/usr/bin/env bash
@@ -2016,7 +1895,7 @@ set -euo pipefail
 
 ID="__ID__"
 CONF="__CONF__"
-PEER_GRE_IP="__PEER_GRE_IP__"
+UNIT="/etc/systemd/system/gre__ID__.service"
 LOG_FILE="/var/log/sepehr-monitor-gre__ID__.log"
 MAX_FAILS=3
 
@@ -2024,6 +1903,22 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"; }
 
 [[ -f "$CONF" ]] || { log "ERROR: Config not found: $CONF"; exit 1; }
 source "$CONF"
+
+# Get current local GRE IP from service file and calculate peer
+LOCAL_GRE_IP=$(grep -oP 'ip addr add \K[0-9.]+' "$UNIT" 2>/dev/null | head -n1 || true)
+if [[ -z "$LOCAL_GRE_IP" ]]; then
+  log "ERROR: Cannot detect local GRE IP from $UNIT"
+  exit 1
+fi
+
+# Calculate peer IP (change last octet: .1 -> .2, .2 -> .1)
+GRE_PREFIX="${LOCAL_GRE_IP%.*}"
+LAST_OCTET="${LOCAL_GRE_IP##*.}"
+if [[ "$LAST_OCTET" == "1" ]]; then
+  PEER_GRE_IP="${GRE_PREFIX}.2"
+else
+  PEER_GRE_IP="${GRE_PREFIX}.1"
+fi
 
 # Ping test
 if ping -c 2 -W 3 "$PEER_GRE_IP" >/dev/null 2>&1; then
@@ -2043,39 +1938,56 @@ sed -i "s/^FAIL_COUNT=.*/FAIL_COUNT=${NEW_FAIL}/" "$CONF"
 log "Ping failed (${NEW_FAIL}/${MAX_FAILS})"
 
 if ((NEW_FAIL >= MAX_FAILS)); then
-  # Trigger failover
-  log "MAX FAILS reached - triggering IP rotation"
+  # Blacklist current path and let cron select next active path
+  log "MAX FAILS reached - blacklisting current path"
 
-  source "$CONF"
-  NEW_OFFSET=$((OFFSET + 1))
-  sed -i "s/^OFFSET=.*/OFFSET=${NEW_OFFSET}/" "$CONF"
+  # Get current public IPs from service file
+  CURRENT_LOCAL=$(grep -oP 'ip tunnel add gre[0-9]+ mode gre local \K[0-9.]+' "$UNIT" 2>/dev/null | head -n1 || true)
+  CURRENT_REMOTE=$(grep -oP 'remote \K[0-9.]+' "$UNIT" 2>/dev/null | head -n1 || true)
+
+  if [[ -n "$CURRENT_LOCAL" && -n "$CURRENT_REMOTE" ]]; then
+    source "$CONF"
+    IFS=',' read -r -a local_arr <<< "$LOCAL_IPS"
+    IFS=',' read -r -a remote_arr <<< "$REMOTE_IPS"
+
+    local_count=${#local_arr[@]}
+    remote_count=${#remote_arr[@]}
+
+    # Find current path index
+    local_idx=-1
+    remote_idx=-1
+    for ((i=0; i<local_count; i++)); do
+      [[ "${local_arr[$i]}" == "$CURRENT_LOCAL" ]] && local_idx=$i && break
+    done
+    for ((i=0; i<remote_count; i++)); do
+      [[ "${remote_arr[$i]}" == "$CURRENT_REMOTE" ]] && remote_idx=$i && break
+    done
+
+    if ((local_idx >= 0 && remote_idx >= 0)); then
+      path_index=$((local_idx * remote_count + remote_idx))
+
+      # Add to blacklist if not already there
+      current_blacklist="${BLACKLIST:-}"
+      if [[ -z "$current_blacklist" ]]; then
+        new_blacklist="$path_index"
+      elif [[ ! ",$current_blacklist," =~ ,$path_index, ]]; then
+        new_blacklist="${current_blacklist},${path_index}"
+      else
+        new_blacklist="$current_blacklist"
+      fi
+
+      sed -i "s/^BLACKLIST=.*/BLACKLIST=\"${new_blacklist}\"/" "$CONF"
+      log "Blacklisted path $path_index (${CURRENT_LOCAL} -> ${CURRENT_REMOTE})"
+    fi
+  fi
+
   sed -i "s/^FAIL_COUNT=.*/FAIL_COUNT=0/" "$CONF"
 
-  # Recalculate IPs
-  source "$CONF"
-  IFS=',' read -r -a local_arr <<< "$LOCAL_IPS"
-  IFS=',' read -r -a remote_arr <<< "$REMOTE_IPS"
-
-  day=$(TZ="Asia/Tehran" date +%d)
-  hour=$(TZ="Asia/Tehran" date +%H)
-
-  index_local=$(( (10#$day + 10#$hour + NEW_OFFSET) % ${#local_arr[@]} ))
-  index_remote=$(( (10#$day + 10#$hour + NEW_OFFSET) % ${#remote_arr[@]} ))
-
-  NEW_LOCAL="${local_arr[$index_local]}"
-  NEW_REMOTE="${remote_arr[$index_remote]}"
-
-  log "New IPs: Local=$NEW_LOCAL Remote=$NEW_REMOTE (offset=$NEW_OFFSET)"
-
-  # Apply to service file
-  UNIT="/etc/systemd/system/gre$ID.service"
+  # Restart tunnel - cron will select next active path
   if [[ -f "$UNIT" ]]; then
-    sed -i -E "s/(ip tunnel add gre$ID mode gre local )[0-9.]+/\1$NEW_LOCAL/" "$UNIT"
-    sed -i -E "s/(remote )[0-9.]+ (ttl)/\1$NEW_REMOTE \2/" "$UNIT"
-
     systemctl daemon-reload
     systemctl restart "gre$ID.service"
-    log "GRE$ID restarted with new IPs"
+    log "GRE$ID restarted"
 
     # Restart haproxy if IRAN side
     if [[ "$SIDE" == "IRAN" ]]; then
@@ -2088,7 +2000,6 @@ MONITOR_SCRIPT
 
   sed -i "s|__ID__|${id}|g" "$script"
   sed -i "s|__CONF__|${conf}|g" "$script"
-  sed -i "s|__PEER_GRE_IP__|${peer_gre_ip}|g" "$script"
   chmod +x "$script"
 
   add_log "Creating systemd service: $service"
@@ -2143,9 +2054,9 @@ setup_monitor() {
   echo "  Log   : /var/log/sepehr-monitor-gre${id}.log"
   echo
   echo "The monitor will:"
-  echo "  1. Check tunnel connectivity every 10 seconds"
-  echo "  2. After 3 failures, increment OFFSET and switch IPs"
-  echo "  3. Both servers should have monitor enabled for sync"
+  echo "  1. Check tunnel connectivity every 60 seconds"
+  echo "  2. After 3 failures, blacklist current path"
+  echo "  3. Cron will automatically select next active path"
   echo
   show_unit_status_brief "sepehr-monitor-gre${id}.timer"
   pause_enter
@@ -2209,6 +2120,83 @@ show_tunnels_status() {
   echo
 }
 
+fix_all_tunnels() {
+  render
+  echo "╔══════════════════════════════════════════════════════════════╗"
+  echo "║           FIX ALL TUNNELS - Update Scripts                   ║"
+  echo "╚══════════════════════════════════════════════════════════════╝"
+  echo
+
+  mapfile -t GRE_IDS < <(get_gre_ids)
+
+  if ((${#GRE_IDS[@]} == 0)); then
+    add_log "No tunnels found."
+    pause_enter
+    return 0
+  fi
+
+  echo "Found ${#GRE_IDS[@]} tunnel(s): ${GRE_IDS[*]}"
+  echo
+  echo "This will:"
+  echo "  1. Reset BLACKLIST for all tunnels"
+  echo "  2. Recreate rotation scripts with new code"
+  echo "  3. Recreate monitors with new code"
+  echo "  4. Fix HAProxy configs (IRAN side only)"
+  echo
+  read -r -p "Continue? (y/n): " confirm
+  [[ "${confirm,,}" != "y" ]] && return 0
+
+  local id conf side
+  for id in "${GRE_IDS[@]}"; do
+    conf="$(sepehr_conf_path "$id")"
+
+    if [[ -f "$conf" ]]; then
+      source "$conf"
+      side="${SIDE:-KHAREJ}"
+
+      echo
+      add_log "Fixing GRE${id} (${side})..."
+
+      # 1. Reset BLACKLIST and FAIL_COUNT
+      sed -i 's/^BLACKLIST=.*/BLACKLIST=""/' "$conf"
+      sed -i "s/^FAIL_COUNT=.*/FAIL_COUNT=0/" "$conf"
+      add_log "  Reset BLACKLIST and FAIL_COUNT"
+
+      # 2. Recreate rotation script
+      create_auto_cron "$id" "$side"
+      add_log "  Recreated rotation script"
+
+      # 3. Recreate monitor
+      create_monitor_service "$id"
+      add_log "  Recreated monitor"
+
+      # 4. Fix HAProxy if IRAN
+      if [[ "$side" == "IRAN" ]]; then
+        local hap_cfg="/etc/haproxy/conf.d/haproxy-gre${id}.cfg"
+        if [[ -f "$hap_cfg" ]]; then
+          # Change .1 to .2 in backend
+          sed -i 's/\([0-9]\+\.[0-9]\+\.[0-9]\+\.\)1:/\12:/g' "$hap_cfg"
+          add_log "  Fixed HAProxy peer IP"
+        fi
+      fi
+
+      add_log "  ✓ GRE${id} fixed"
+    else
+      add_log "  ✗ Config not found for GRE${id}"
+    fi
+  done
+
+  # Restart HAProxy if any IRAN side
+  if systemctl is-active haproxy >/dev/null 2>&1; then
+    systemctl restart haproxy 2>/dev/null || true
+    add_log "HAProxy restarted"
+  fi
+
+  echo
+  add_log "All tunnels fixed!"
+  pause_enter
+}
+
 main_menu() {
   local choice=""
   while true; do
@@ -2225,6 +2213,7 @@ main_menu() {
     echo "9 > Edit Tunnel IPs"
     echo "10> View IP State"
     echo "11> Setup Monitor (Self-Healing)"
+    echo "12> Fix All Tunnels (Update Scripts)"
     echo "0 > Exit"
     echo
     read -r -e -p "Select option: " choice
@@ -2242,6 +2231,7 @@ main_menu() {
       9) add_log "Selected: Edit Tunnel IPs"; edit_tunnel_ips ;;
       10) add_log "Selected: View IP State"; view_ip_state ;;
       11) add_log "Selected: Setup Monitor"; setup_monitor ;;
+      12) add_log "Selected: Fix All Tunnels"; fix_all_tunnels ;;
       0) add_log "Bye!"; render; exit 0 ;;
       *) add_log "Invalid option: $choice" ;;
     esac
