@@ -110,6 +110,17 @@ valid_gre_base() {
   return 0
 }
 
+random_gre_base() {
+  # Generate random private IP range for GRE tunnel
+  # Uses 10.x.x.0 or 172.16-31.x.0 or 192.168.x.0
+  local type=$((RANDOM % 3))
+  case $type in
+    0) echo "10.$((RANDOM % 256)).$((RANDOM % 256)).0" ;;
+    1) echo "172.$((16 + RANDOM % 16)).$((RANDOM % 256)).0" ;;
+    2) echo "192.168.$((RANDOM % 256)).0" ;;
+  esac
+}
+
 ipv4_set_last_octet() {
   local ip="$1" last="$2"
   IFS='.' read -r a b c d <<<"$ip"
@@ -240,6 +251,263 @@ ask_ports() {
     add_log "Ports accepted: ${PORT_LIST[*]}"
     return 0
   done
+}
+
+SEPEHR_CONF_DIR="/etc/sepehr"
+
+ensure_sepehr_conf_dir() {
+  mkdir -p "$SEPEHR_CONF_DIR" >/dev/null 2>&1 || true
+}
+
+sepehr_conf_path() {
+  local id="$1"
+  echo "${SEPEHR_CONF_DIR}/gre${id}.conf"
+}
+
+ask_multiple_local_ips() {
+  local prompt="$1" __var="$2"
+  local -a SERVER_IPS=()
+  local -a SELECTED_IPS=()
+  mapfile -t SERVER_IPS < <(get_server_ips)
+
+  if ((${#SERVER_IPS[@]} == 0)); then
+    add_log "ERROR: No public IPs detected on this server."
+    return 1
+  fi
+
+  while true; do
+    render
+    echo "$prompt"
+    echo "(Select multiple IPs, enter 'd' when done)"
+    echo
+    local i
+    for ((i=0; i<${#SERVER_IPS[@]}; i++)); do
+      local marker=" "
+      for sel in "${SELECTED_IPS[@]}"; do
+        [[ "$sel" == "${SERVER_IPS[$i]}" ]] && marker="*"
+      done
+      printf "%d) [%s] %s\n" $((i+1)) "$marker" "${SERVER_IPS[$i]}"
+    done
+    echo
+    echo "Selected: ${SELECTED_IPS[*]:-none}"
+    echo
+    echo "0) Enter IP manually"
+    echo "d) Done selecting"
+    echo
+
+    local choice
+    read -r -e -p "Select: " choice
+    choice="$(trim "$choice")"
+
+    if [[ "${choice,,}" == "d" || "${choice,,}" == "done" ]]; then
+      if ((${#SELECTED_IPS[@]} == 0)); then
+        add_log "ERROR: Select at least one IP."
+        continue
+      fi
+      break
+    fi
+
+    if [[ "$choice" == "0" ]]; then
+      local manual_ip
+      ask_until_valid "Enter IP manually:" valid_ipv4 manual_ip
+      local exists=0
+      for sel in "${SELECTED_IPS[@]}"; do
+        [[ "$sel" == "$manual_ip" ]] && exists=1
+      done
+      if ((exists == 0)); then
+        SELECTED_IPS+=("$manual_ip")
+        add_log "Added (manual): $manual_ip"
+      else
+        add_log "Already selected: $manual_ip"
+      fi
+      continue
+    fi
+
+    if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice>=1 && choice<=${#SERVER_IPS[@]})); then
+      local ip="${SERVER_IPS[$((choice-1))]}"
+      local exists=0 idx=-1 j
+      for ((j=0; j<${#SELECTED_IPS[@]}; j++)); do
+        if [[ "${SELECTED_IPS[$j]}" == "$ip" ]]; then
+          exists=1
+          idx=$j
+        fi
+      done
+      if ((exists == 1)); then
+        unset 'SELECTED_IPS[idx]'
+        SELECTED_IPS=("${SELECTED_IPS[@]}")
+        add_log "Removed: $ip"
+      else
+        SELECTED_IPS+=("$ip")
+        add_log "Added: $ip"
+      fi
+      continue
+    fi
+
+    add_log "Invalid selection: $choice"
+  done
+
+  local result
+  result=$(printf '%s,' "${SELECTED_IPS[@]}")
+  result="${result%,}"
+  printf -v "$__var" '%s' "$result"
+  add_log "Local IPs: $result"
+  return 0
+}
+
+ask_remote_ips() {
+  local prompt="$1" __var="$2"
+  local -a REMOTE_IPS=()
+
+  while true; do
+    render
+    echo "$prompt"
+    echo "(Enter IPs one by one, 'd' when done)"
+    echo
+    echo "Current list: ${REMOTE_IPS[*]:-none}"
+    echo
+
+    local input
+    read -r -e -p "Enter IP (or 'd'): " input
+    input="$(trim "$input")"
+
+    if [[ "${input,,}" == "d" || "${input,,}" == "done" ]]; then
+      if ((${#REMOTE_IPS[@]} == 0)); then
+        add_log "ERROR: Enter at least one remote IP."
+        continue
+      fi
+      break
+    fi
+
+    if valid_ipv4 "$input"; then
+      local exists=0
+      for r in "${REMOTE_IPS[@]}"; do
+        [[ "$r" == "$input" ]] && exists=1
+      done
+      if ((exists == 0)); then
+        REMOTE_IPS+=("$input")
+        add_log "Added remote: $input"
+      else
+        add_log "Already exists: $input"
+      fi
+    else
+      add_log "Invalid IP: $input"
+    fi
+  done
+
+  local result
+  result=$(printf '%s,' "${REMOTE_IPS[@]}")
+  result="${result%,}"
+  printf -v "$__var" '%s' "$result"
+  add_log "Remote IPs: $result"
+  return 0
+}
+
+write_sepehr_conf() {
+  local id="$1" side="$2" local_ips="$3" remote_ips="$4" gre_base="$5" mtu="$6"
+  local conf
+  conf="$(sepehr_conf_path "$id")"
+
+  ensure_sepehr_conf_dir
+
+  cat >"$conf" <<EOF
+# Sepehr GRE${id} Configuration
+# Generated: $(date '+%Y-%m-%d %H:%M:%S')
+SIDE="${side}"
+LOCAL_IPS="${local_ips}"
+REMOTE_IPS="${remote_ips}"
+GRE_BASE="${gre_base}"
+MTU="${mtu}"
+OFFSET=0
+FAIL_COUNT=0
+LAST_SUCCESS=$(date +%s)
+EOF
+
+  add_log "Config written: $conf"
+  return 0
+}
+
+read_sepehr_conf() {
+  local id="$1"
+  local conf
+  conf="$(sepehr_conf_path "$id")"
+  [[ -f "$conf" ]] || return 1
+  source "$conf"
+  return 0
+}
+
+calculate_current_ips() {
+  local id="$1"
+  local conf
+  conf="$(sepehr_conf_path "$id")"
+  [[ -f "$conf" ]] || return 1
+
+  source "$conf"
+
+  IFS=',' read -r -a local_arr <<< "$LOCAL_IPS"
+  IFS=',' read -r -a remote_arr <<< "$REMOTE_IPS"
+
+  local count_local=${#local_arr[@]}
+  local count_remote=${#remote_arr[@]}
+
+  local day hour offset
+  day=$(TZ="Asia/Tehran" date +%d)
+  hour=$(TZ="Asia/Tehran" date +%H)
+  offset=${OFFSET:-0}
+
+  local index_local=$(( (10#$day + 10#$hour + offset) % count_local ))
+  local index_remote=$(( (10#$day + 10#$hour + offset) % count_remote ))
+
+  CALC_LOCAL_IP="${local_arr[$index_local]}"
+  CALC_REMOTE_IP="${remote_arr[$index_remote]}"
+
+  return 0
+}
+
+apply_calculated_ips() {
+  local id="$1"
+  calculate_current_ips "$id" || return 1
+
+  local unit="/etc/systemd/system/gre${id}.service"
+  [[ -f "$unit" ]] || return 1
+
+  sed -i -E "s/(ip tunnel add gre${id} mode gre local )[0-9.]+/\1${CALC_LOCAL_IP}/" "$unit"
+  sed -i -E "s/(remote )[0-9.]+ (ttl)/\1${CALC_REMOTE_IP} \2/" "$unit"
+
+  local conf
+  conf="$(sepehr_conf_path "$id")"
+  source "$conf"
+  if [[ "$SIDE" == "IRAN" ]]; then
+    local hap_cfg="/etc/haproxy/conf.d/haproxy-gre${id}.cfg"
+    if [[ -f "$hap_cfg" ]]; then
+      local peer_gre_ip
+      peer_gre_ip="$(ipv4_set_last_octet "$GRE_BASE" 2)"
+      sed -i -E "s/(server[[:space:]]+gre${id}_b_[0-9]+[[:space:]]+)[0-9.]+(:)/\1${peer_gre_ip}\2/g" "$hap_cfg"
+    fi
+  fi
+
+  return 0
+}
+
+increment_offset() {
+  local id="$1"
+  local conf
+  conf="$(sepehr_conf_path "$id")"
+  [[ -f "$conf" ]] || return 1
+
+  source "$conf"
+  local new_offset=$((OFFSET + 1))
+  sed -i "s/^OFFSET=.*/OFFSET=${new_offset}/" "$conf"
+  add_log "GRE${id}: OFFSET incremented to ${new_offset}"
+  return 0
+}
+
+reset_fail_count() {
+  local id="$1"
+  local conf
+  conf="$(sepehr_conf_path "$id")"
+  [[ -f "$conf" ]] || return 1
+  sed -i "s/^FAIL_COUNT=.*/FAIL_COUNT=0/" "$conf"
+  sed -i "s/^LAST_SUCCESS=.*/LAST_SUCCESS=$(date +%s)/" "$conf"
 }
 
 ensure_iproute_only() {
@@ -468,13 +736,13 @@ haproxy_apply_and_show() {
 
 
 iran_setup() {
-  local ID IRANIP KHAREJIP GREBASE
+  local ID LOCAL_IPS_STR REMOTE_IPS_STR GREBASE
   local -a PORT_LIST=()
 
   ask_until_valid "GRE Number :" is_int ID
-  select_local_ip "Select IRAN IP (local server):" IRANIP || { die_soft "Failed to select local IP."; return 0; }
-  ask_until_valid "KHAREJ IP (remote server):" valid_ipv4 KHAREJIP
-  ask_until_valid "GRE IP RANG (Example : 10.80.70.0):" valid_gre_base GREBASE
+  ask_multiple_local_ips "Select IRAN IPs (local server):" LOCAL_IPS_STR || { die_soft "Failed to select local IPs."; return 0; }
+  ask_remote_ips "Enter KHAREJ IPs (remote server):" REMOTE_IPS_STR || { die_soft "Failed to enter remote IPs."; return 0; }
+  ask_until_valid "GRE IP RANG (Example: $(random_gre_base)):" valid_gre_base GREBASE
   ask_ports
 
   local use_mtu="n" MTU_VALUE=""
@@ -489,7 +757,8 @@ iran_setup() {
         break
         ;;
       n|no|"")
-        MTU_VALUE=""
+        MTU_VALUE="1420"
+        add_log "Using default MTU: 1420"
         break
         ;;
       *)
@@ -504,6 +773,13 @@ iran_setup() {
   local_gre_ip="$(ipv4_set_last_octet "$GREBASE" 1)"
   peer_gre_ip="$(ipv4_set_last_octet "$GREBASE" 2)"
   add_log "KEY=${key} | IRAN=${local_gre_ip} | KHAREJ=${peer_gre_ip}"
+
+  # Calculate current IP from lists
+  write_sepehr_conf "$ID" "IRAN" "$LOCAL_IPS_STR" "$REMOTE_IPS_STR" "$GREBASE" "$MTU_VALUE"
+  calculate_current_ips "$ID" || { die_soft "Failed to calculate IPs."; return 0; }
+  local IRANIP="$CALC_LOCAL_IP"
+  local KHAREJIP="$CALC_REMOTE_IP"
+  add_log "Using IPs: Local=$IRANIP Remote=$KHAREJIP"
 
   ensure_packages || { die_soft "Package installation failed."; return 0; }
 
@@ -545,20 +821,29 @@ iran_setup() {
   echo "GRE IPs:"
   echo "  IRAN  : ${local_gre_ip}"
   echo "  KHAREJ: ${peer_gre_ip}"
+  echo "  Public Local : ${IRANIP}"
+  echo "  Public Remote: ${KHAREJIP}"
+  echo "  Config: $(sepehr_conf_path "$ID")"
   echo
   echo "Status:"
   show_unit_status_brief "gre${ID}.service"
+  echo
+
+  # Auto-enable monitor for self-healing
+  add_log "Enabling Self-Healing Monitor..."
+  create_monitor_service "$ID" && add_log "Monitor enabled for GRE${ID}" || add_log "WARNING: Monitor setup failed"
+  echo "Monitor: sepehr-monitor-gre${ID}.timer (active)"
   pause_enter
 }
 
 kharej_setup() {
-  local ID KHAREJIP IRANIP GREBASE
+  local ID LOCAL_IPS_STR REMOTE_IPS_STR GREBASE
   local use_mtu="n" MTU_VALUE=""
 
   ask_until_valid "GRE Number(Like IRAN PLEASE) :" is_int ID
-  select_local_ip "Select KHAREJ IP (local server):" KHAREJIP || { die_soft "Failed to select local IP."; return 0; }
-  ask_until_valid "IRAN IP (remote server):" valid_ipv4 IRANIP
-  ask_until_valid "GRE IP RANG (Example : 10.80.70.0) Like IRAN PLEASE:" valid_gre_base GREBASE
+  ask_multiple_local_ips "Select KHAREJ IPs (local server):" LOCAL_IPS_STR || { die_soft "Failed to select local IPs."; return 0; }
+  ask_remote_ips "Enter IRAN IPs (remote server):" REMOTE_IPS_STR || { die_soft "Failed to enter remote IPs."; return 0; }
+  ask_until_valid "GRE IP RANG (Like IRAN - Example: $(random_gre_base)):" valid_gre_base GREBASE
 
   while true; do
     render
@@ -570,7 +855,8 @@ kharej_setup() {
         break
         ;;
       n|no|"")
-        MTU_VALUE=""
+        MTU_VALUE="1420"
+        add_log "Using default MTU: 1420"
         break
         ;;
       *)
@@ -584,6 +870,13 @@ kharej_setup() {
   local_gre_ip="$(ipv4_set_last_octet "$GREBASE" 2)"
   peer_gre_ip="$(ipv4_set_last_octet "$GREBASE" 1)"
   add_log "KEY=${key} | KHAREJ=${local_gre_ip} | IRAN=${peer_gre_ip}"
+
+  # Calculate current IP from lists
+  write_sepehr_conf "$ID" "KHAREJ" "$LOCAL_IPS_STR" "$REMOTE_IPS_STR" "$GREBASE" "$MTU_VALUE"
+  calculate_current_ips "$ID" || { die_soft "Failed to calculate IPs."; return 0; }
+  local KHAREJIP="$CALC_LOCAL_IP"
+  local IRANIP="$CALC_REMOTE_IP"
+  add_log "Using IPs: Local=$KHAREJIP Remote=$IRANIP"
 
   ensure_iproute_only || { die_soft "Package installation failed (iproute2)."; return 0; }
 
@@ -602,8 +895,17 @@ kharej_setup() {
   echo "GRE IPs:"
   echo "  KHAREJ: ${local_gre_ip}"
   echo "  IRAN  : ${peer_gre_ip}"
+  echo "  Public Local : ${KHAREJIP}"
+  echo "  Public Remote: ${IRANIP}"
+  echo "  Config: $(sepehr_conf_path "$ID")"
   echo
   show_unit_status_brief "gre${ID}.service"
+  echo
+
+  # Auto-enable monitor for self-healing
+  add_log "Enabling Self-Healing Monitor..."
+  create_monitor_service "$ID" && add_log "Monitor enabled for GRE${ID}" || add_log "WARNING: Monitor setup failed"
+  echo "Monitor: sepehr-monitor-gre${ID}.timer (active)"
   pause_enter
 }
 
@@ -1495,6 +1797,17 @@ edit_tunnel_ips() {
     sed -i -E "s/(remote )[0-9.]+ (ttl)/\\1${new_remote} \\2/" "$backup"
   fi
 
+  # Update config file if exists
+  local conf
+  conf="$(sepehr_conf_path "$id")"
+  if [[ -f "$conf" ]]; then
+    add_log "Updating config: $conf"
+    sed -i "s/^LOCAL_IPS=.*/LOCAL_IPS=\"${new_local}\"/" "$conf"
+    sed -i "s/^REMOTE_IPS=.*/REMOTE_IPS=\"${new_remote}\"/" "$conf"
+    sed -i "s/^OFFSET=.*/OFFSET=0/" "$conf"
+    add_log "Config updated - OFFSET reset to 0"
+  fi
+
   add_log "Reloading systemd..."
   systemctl daemon-reload >/dev/null 2>&1 || true
 
@@ -1511,6 +1824,223 @@ edit_tunnel_ips() {
   pause_enter
 }
 
+view_ip_state() {
+  local id
+
+  mapfile -t GRE_IDS < <(get_gre_ids)
+  local -a GRE_LABELS=()
+  for id in "${GRE_IDS[@]}"; do GRE_LABELS+=("GRE${id}"); done
+
+  if ! menu_select_index "View IP State" "Select GRE:" "${GRE_LABELS[@]}"; then
+    return 0
+  fi
+  id="${GRE_IDS[$MENU_SELECTED]}"
+
+  local conf
+  conf="$(sepehr_conf_path "$id")"
+  if [[ ! -f "$conf" ]]; then
+    render
+    echo "No config found: $conf"
+    echo "This tunnel may have been created without multi-IP support."
+    pause_enter
+    return 0
+  fi
+
+  source "$conf"
+  calculate_current_ips "$id"
+
+  render
+  echo "═══════════════════════════════════════════════════════"
+  echo "             GRE${id} IP STATE"
+  echo "═══════════════════════════════════════════════════════"
+  echo
+  echo "  SIDE: ${SIDE}"
+  echo
+  echo "  LOCAL IPs : ${LOCAL_IPS}"
+  echo "  REMOTE IPs: ${REMOTE_IPS}"
+  echo
+  echo "  CURRENT OFFSET: ${OFFSET}"
+  echo
+  echo "  ─────────────────────────────────────────────────────"
+  echo "  CALCULATED (active now):"
+  echo "    Local IP : ${CALC_LOCAL_IP}"
+  echo "    Remote IP: ${CALC_REMOTE_IP}"
+  echo "  ─────────────────────────────────────────────────────"
+  echo
+  echo "  GRE BASE: ${GRE_BASE}"
+  echo "  MTU: ${MTU:-default}"
+  echo "  FAIL COUNT: ${FAIL_COUNT}"
+  echo "  LAST SUCCESS: $(date -d @${LAST_SUCCESS} '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo $LAST_SUCCESS)"
+  echo
+  echo "  Config file: $conf"
+  echo
+  echo "═══════════════════════════════════════════════════════"
+  pause_enter
+}
+
+create_monitor_service() {
+  local id="$1"
+  local script="/usr/local/bin/sepehr-monitor-gre${id}.sh"
+  local service="/etc/systemd/system/sepehr-monitor-gre${id}.service"
+  local timer="/etc/systemd/system/sepehr-monitor-gre${id}.timer"
+
+  local conf
+  conf="$(sepehr_conf_path "$id")"
+  if [[ ! -f "$conf" ]]; then
+    add_log "ERROR: Config not found: $conf"
+    return 1
+  fi
+
+  source "$conf"
+  local peer_gre_ip
+  if [[ "$SIDE" == "IRAN" ]]; then
+    peer_gre_ip="$(ipv4_set_last_octet "$GRE_BASE" 2)"
+  else
+    peer_gre_ip="$(ipv4_set_last_octet "$GRE_BASE" 1)"
+  fi
+
+  add_log "Creating monitor script: $script"
+  cat >"$script" <<'MONITOR_SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ID="__ID__"
+CONF="__CONF__"
+PEER_GRE_IP="__PEER_GRE_IP__"
+LOG_FILE="/var/log/sepehr-monitor-gre__ID__.log"
+MAX_FAILS=3
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"; }
+
+[[ -f "$CONF" ]] || { log "ERROR: Config not found: $CONF"; exit 1; }
+source "$CONF"
+
+# Ping test
+if ping -c 2 -W 3 "$PEER_GRE_IP" >/dev/null 2>&1; then
+  # Success - reset fail count
+  if [[ "${FAIL_COUNT:-0}" != "0" ]]; then
+    sed -i "s/^FAIL_COUNT=.*/FAIL_COUNT=0/" "$CONF"
+    sed -i "s/^LAST_SUCCESS=.*/LAST_SUCCESS=$(date +%s)/" "$CONF"
+    log "Connection OK - fail count reset"
+  fi
+  exit 0
+fi
+
+# Failed - increment fail count
+source "$CONF"
+NEW_FAIL=$((FAIL_COUNT + 1))
+sed -i "s/^FAIL_COUNT=.*/FAIL_COUNT=${NEW_FAIL}/" "$CONF"
+log "Ping failed (${NEW_FAIL}/${MAX_FAILS})"
+
+if ((NEW_FAIL >= MAX_FAILS)); then
+  # Trigger failover
+  log "MAX FAILS reached - triggering IP rotation"
+
+  source "$CONF"
+  NEW_OFFSET=$((OFFSET + 1))
+  sed -i "s/^OFFSET=.*/OFFSET=${NEW_OFFSET}/" "$CONF"
+  sed -i "s/^FAIL_COUNT=.*/FAIL_COUNT=0/" "$CONF"
+
+  # Recalculate IPs
+  source "$CONF"
+  IFS=',' read -r -a local_arr <<< "$LOCAL_IPS"
+  IFS=',' read -r -a remote_arr <<< "$REMOTE_IPS"
+
+  day=$(TZ="Asia/Tehran" date +%d)
+  hour=$(TZ="Asia/Tehran" date +%H)
+
+  index_local=$(( (10#$day + 10#$hour + NEW_OFFSET) % ${#local_arr[@]} ))
+  index_remote=$(( (10#$day + 10#$hour + NEW_OFFSET) % ${#remote_arr[@]} ))
+
+  NEW_LOCAL="${local_arr[$index_local]}"
+  NEW_REMOTE="${remote_arr[$index_remote]}"
+
+  log "New IPs: Local=$NEW_LOCAL Remote=$NEW_REMOTE (offset=$NEW_OFFSET)"
+
+  # Apply to service file
+  UNIT="/etc/systemd/system/gre$ID.service"
+  if [[ -f "$UNIT" ]]; then
+    sed -i -E "s/(ip tunnel add gre$ID mode gre local )[0-9.]+/\1$NEW_LOCAL/" "$UNIT"
+    sed -i -E "s/(remote )[0-9.]+ (ttl)/\1$NEW_REMOTE \2/" "$UNIT"
+
+    systemctl daemon-reload
+    systemctl restart "gre$ID.service"
+    log "GRE$ID restarted with new IPs"
+
+    # Restart haproxy if IRAN side
+    if [[ "$SIDE" == "IRAN" ]]; then
+      systemctl restart haproxy 2>/dev/null || true
+      log "HAProxy restarted"
+    fi
+  fi
+fi
+MONITOR_SCRIPT
+
+  sed -i "s|__ID__|${id}|g" "$script"
+  sed -i "s|__CONF__|${conf}|g" "$script"
+  sed -i "s|__PEER_GRE_IP__|${peer_gre_ip}|g" "$script"
+  chmod +x "$script"
+
+  add_log "Creating systemd service: $service"
+  cat >"$service" <<EOF
+[Unit]
+Description=Sepehr GRE${id} Monitor
+
+[Service]
+Type=oneshot
+ExecStart=${script}
+EOF
+
+  add_log "Creating systemd timer: $timer"
+  cat >"$timer" <<EOF
+[Unit]
+Description=Sepehr GRE${id} Monitor Timer
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=10
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now "sepehr-monitor-gre${id}.timer" >/dev/null 2>&1 || true
+
+  add_log "Monitor enabled for GRE${id}"
+  return 0
+}
+
+setup_monitor() {
+  local id
+
+  mapfile -t GRE_IDS < <(get_gre_ids)
+  local -a GRE_LABELS=()
+  for id in "${GRE_IDS[@]}"; do GRE_LABELS+=("GRE${id}"); done
+
+  if ! menu_select_index "Setup Monitor (Self-Healing)" "Select GRE:" "${GRE_LABELS[@]}"; then
+    return 0
+  fi
+  id="${GRE_IDS[$MENU_SELECTED]}"
+
+  create_monitor_service "$id" || { die_soft "Failed to create monitor service."; return 0; }
+
+  render
+  echo "Monitor Setup Complete for GRE${id}"
+  echo
+  echo "  Script: /usr/local/bin/sepehr-monitor-gre${id}.sh"
+  echo "  Timer : sepehr-monitor-gre${id}.timer"
+  echo "  Log   : /var/log/sepehr-monitor-gre${id}.log"
+  echo
+  echo "The monitor will:"
+  echo "  1. Check tunnel connectivity every 10 seconds"
+  echo "  2. After 3 failures, increment OFFSET and switch IPs"
+  echo "  3. Both servers should have monitor enabled for sync"
+  echo
+  show_unit_status_brief "sepehr-monitor-gre${id}.timer"
+  pause_enter
+}
+
 main_menu() {
   local choice=""
   while true; do
@@ -1519,11 +2049,13 @@ main_menu() {
     echo "2 > KHAREJ SETUP"
     echo "3 > Services ManageMent"
     echo "4 > Unistall & Clean"
-	echo "5 > ADD TUNNEL PORT"
-	echo "6 > Rebuild Automation"
-	echo "7 > Regenerate Automation"
-	echo "8 > Change MTU"
-	echo "9 > Edit Tunnel IPs"
+    echo "5 > ADD TUNNEL PORT"
+    echo "6 > Rebuild Automation"
+    echo "7 > Regenerate Automation"
+    echo "8 > Change MTU"
+    echo "9 > Edit Tunnel IPs"
+    echo "10> View IP State"
+    echo "11> Setup Monitor (Self-Healing)"
     echo "0 > Exit"
     echo
     read -r -e -p "Select option: " choice
@@ -1534,11 +2066,13 @@ main_menu() {
       2) add_log "Selected: KHAREJ SETUP"; kharej_setup ;;
       3) add_log "Selected: Services ManageMent"; services_management ;;
       4) add_log "Selected: Unistall & Clean"; uninstall_clean ;;
-	  5) add_log "Selected: add tunnel port"; add_tunnel_port ;;
-	  6) add_log "Selected: Rebuild Automation"; recreate_automation_mode ;;
-	  7) add_log "Selected: Regenerate Automation"; recreate_automation ;;
-	  8) add_log "Selected: change mtu"; change_mtu ;;
-	  9) add_log "Selected: Edit Tunnel IPs"; edit_tunnel_ips ;;
+      5) add_log "Selected: add tunnel port"; add_tunnel_port ;;
+      6) add_log "Selected: Rebuild Automation"; recreate_automation_mode ;;
+      7) add_log "Selected: Regenerate Automation"; recreate_automation ;;
+      8) add_log "Selected: change mtu"; change_mtu ;;
+      9) add_log "Selected: Edit Tunnel IPs"; edit_tunnel_ips ;;
+      10) add_log "Selected: View IP State"; view_ip_state ;;
+      11) add_log "Selected: Setup Monitor"; setup_monitor ;;
       0) add_log "Bye!"; render; exit 0 ;;
       *) add_log "Invalid option: $choice" ;;
     esac
