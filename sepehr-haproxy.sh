@@ -2156,38 +2156,34 @@ show_tunnels_status() {
     return 0
   fi
 
-  echo "┌────────────────────────────── ACTIVE TUNNELS ──────────────────────────────┐"
-  local id unit conf local_ip remote_ip side status expected_local expected_remote
+  echo "┌───────────────────────────────── ACTIVE TUNNELS ─────────────────────────────────┐"
+  local id unit conf local_ip remote_ip gre_local_ip gre_remote_ip side status gre_base
   for id in "${gre_ids[@]}"; do
     unit="/etc/systemd/system/gre${id}.service"
     conf="/etc/sepehr/gre${id}.conf"
 
+    # Get public IPs and GRE local IP from unit file
     if [[ -f "$unit" ]]; then
       local_ip=$(grep -oP 'ip tunnel add gre[0-9]+ mode gre local \K[0-9.]+' "$unit" 2>/dev/null | head -n1 || echo "?")
       remote_ip=$(grep -oP 'remote \K[0-9.]+' "$unit" 2>/dev/null | head -n1 || echo "?")
+      gre_local_ip=$(grep -oP 'ip addr add \K[0-9.]+' "$unit" 2>/dev/null | head -n1 || echo "?")
     else
       local_ip="?"
       remote_ip="?"
+      gre_local_ip="?"
     fi
 
-    expected_local="?"
-    expected_remote="?"
+    # Get side and calculate peer GRE IP
+    gre_remote_ip="?"
     if [[ -f "$conf" ]]; then
       source "$conf"
       side="${SIDE:-?}"
-
-      # Calculate expected IPs
-      if [[ -n "$LOCAL_IPS" && -n "$REMOTE_IPS" ]]; then
-        IFS=',' read -r -a local_arr <<< "$LOCAL_IPS"
-        IFS=',' read -r -a remote_arr <<< "$REMOTE_IPS"
-        local day hour offset
-        day=$(TZ="Asia/Tehran" date +%d)
-        hour=$(TZ="Asia/Tehran" date +%H)
-        offset=${OFFSET:-0}
-        local idx_l=$(( (10#$day + 10#$hour + offset) % ${#local_arr[@]} ))
-        local idx_r=$(( (10#$day + 10#$hour + offset) % ${#remote_arr[@]} ))
-        expected_local="${local_arr[$idx_l]}"
-        expected_remote="${remote_arr[$idx_r]}"
+      if [[ -n "$GRE_BASE" ]]; then
+        if [[ "$side" == "IRAN" ]]; then
+          gre_remote_ip="${GRE_BASE%.*}.2"
+        else
+          gre_remote_ip="${GRE_BASE%.*}.1"
+        fi
       fi
     else
       side="?"
@@ -2199,16 +2195,10 @@ show_tunnels_status() {
       status="○"
     fi
 
-    # Compare: if mismatch show warning
-    local match="✓"
-    if [[ "$local_ip" != "$expected_local" || "$remote_ip" != "$expected_remote" ]]; then
-      match="⚠"
-    fi
-
-    printf "│ %s GRE%-2s %-6s %-15s → %-15s (exp: %-15s → %-15s) %s │\n" \
-      "$status" "$id" "$side" "$local_ip" "$remote_ip" "$expected_local" "$expected_remote" "$match"
+    printf "│ %s GRE%-4s %-6s %-15s (%-12s) → %-15s (%-12s) │\n" \
+      "$status" "$id" "$side" "$local_ip" "$gre_local_ip" "$remote_ip" "$gre_remote_ip"
   done
-  echo "└────────────────────────────────────────────────────────────────────────────┘"
+  echo "└──────────────────────────────────────────────────────────────────────────────────┘"
   echo
 }
 
