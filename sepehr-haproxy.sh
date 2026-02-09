@@ -1966,6 +1966,49 @@ view_ip_state() {
   calculate_current_ips "$id"
   local display_blacklist="${BLACKLIST:-}"
   [[ -z "$display_blacklist" ]] && display_blacklist="none"
+  local -a vi_local_arr=() vi_remote_arr=() bl_arr=() bl_lines=()
+  local vi_local_count vi_remote_count vi_iran_count vi_kharej_count vi_total_paths
+  IFS=',' read -r -a vi_local_arr <<< "${LOCAL_IPS:-}"
+  IFS=',' read -r -a vi_remote_arr <<< "${REMOTE_IPS:-}"
+  vi_local_count=${#vi_local_arr[@]}
+  vi_remote_count=${#vi_remote_arr[@]}
+  if [[ "${SIDE:-IRAN}" == "KHAREJ" ]]; then
+    vi_iran_count=$vi_remote_count
+    vi_kharej_count=$vi_local_count
+  else
+    vi_iran_count=$vi_local_count
+    vi_kharej_count=$vi_remote_count
+  fi
+  vi_total_paths=$((vi_iran_count * vi_kharej_count))
+
+  if [[ -n "${BLACKLIST:-}" && $vi_total_paths -gt 0 ]]; then
+    local b p vi_iran_idx vi_kharej_idx blk_local blk_remote
+    IFS=',' read -r -a bl_arr <<< "$BLACKLIST"
+    for b in "${bl_arr[@]}"; do
+      b="$(trim "$b")"
+      [[ -z "$b" ]] && continue
+      if [[ ! "$b" =~ ^[0-9]+$ ]]; then
+        bl_lines+=("path=${b} (invalid index)")
+        continue
+      fi
+      p=$((10#$b))
+      if ((p < 0 || p >= vi_total_paths)); then
+        bl_lines+=("path=${p} (out of range 0-$((vi_total_paths-1)))")
+        continue
+      fi
+
+      vi_iran_idx=$((p / vi_kharej_count))
+      vi_kharej_idx=$((p % vi_kharej_count))
+      if [[ "${SIDE:-IRAN}" == "KHAREJ" ]]; then
+        blk_local="${vi_local_arr[$vi_kharej_idx]}"
+        blk_remote="${vi_remote_arr[$vi_iran_idx]}"
+      else
+        blk_local="${vi_local_arr[$vi_iran_idx]}"
+        blk_remote="${vi_remote_arr[$vi_kharej_idx]}"
+      fi
+      bl_lines+=("path=${p} -> local=${blk_local} remote=${blk_remote}")
+    done
+  fi
 
   render
   echo "═══════════════════════════════════════════════════════"
@@ -1987,6 +2030,14 @@ view_ip_state() {
   echo "  GRE BASE: ${GRE_BASE}"
   echo "  MTU: ${MTU:-default}"
   echo "  BLACKLIST: ${display_blacklist}"
+  if ((${#bl_lines[@]} > 0)); then
+    echo "  BLACKLIST PATHS:"
+    for b in "${bl_lines[@]}"; do
+      echo "    - ${b}"
+    done
+  else
+    echo "  BLACKLIST PATHS: none"
+  fi
   echo "  FAIL COUNT: ${FAIL_COUNT}"
   echo "  LAST SUCCESS: $(date -d @${LAST_SUCCESS} '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo $LAST_SUCCESS)"
   echo
