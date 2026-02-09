@@ -510,6 +510,146 @@ reset_fail_count() {
   sed -i "s/^LAST_SUCCESS=.*/LAST_SUCCESS=$(date +%s)/" "$conf"
 }
 
+create_auto_cron() {
+  local id="$1" side="$2"
+  local script="/usr/local/bin/sepehr-recreate-gre${id}.sh"
+  local cron_line="*/30 * * * * ${script}"
+
+  # Always recreate script to ensure it has latest logic
+  cat > "$script" <<'ROTATION_SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ID="__ID__"
+SIDE="__SIDE__"
+CONF="/etc/sepehr/gre${ID}.conf"
+UNIT="/etc/systemd/system/gre${ID}.service"
+HAP_CFG="/etc/haproxy/conf.d/haproxy-gre${ID}.cfg"
+LOG_FILE="/var/log/sepehr-gre${ID}.log"
+TZ="Asia/Tehran"
+
+mkdir -p /var/log >/dev/null 2>&1 || true
+touch "$LOG_FILE" >/dev/null 2>&1 || true
+
+log() { echo "[$(TZ="$TZ" date '+%Y-%m-%d %H:%M %Z')] $1" >> "$LOG_FILE"; }
+
+[[ -f "$UNIT" ]] || { log "ERROR: Unit not found: $UNIT"; exit 1; }
+
+# ============================================
+# PART 1: Change PUBLIC IPs (multi-IP system)
+# ============================================
+if [[ -f "$CONF" ]]; then
+  source "$CONF"
+
+  IFS=',' read -r -a local_arr <<< "$LOCAL_IPS"
+  IFS=',' read -r -a remote_arr <<< "$REMOTE_IPS"
+
+  day=$(TZ="Asia/Tehran" date +%d)
+  hour=$(TZ="Asia/Tehran" date +%H)
+  offset=${OFFSET:-0}
+
+  index_local=$(( (10#$day + 10#$hour + offset) % ${#local_arr[@]} ))
+  index_remote=$(( (10#$day + 10#$hour + offset) % ${#remote_arr[@]} ))
+
+  NEW_LOCAL="${local_arr[$index_local]}"
+  NEW_REMOTE="${remote_arr[$index_remote]}"
+
+  log "PUBLIC IP rotation: Local=$NEW_LOCAL Remote=$NEW_REMOTE (offset=$offset)"
+
+  sed -i -E "s/(ip tunnel add gre$ID mode gre local )[0-9.]+/\1$NEW_LOCAL/" "$UNIT"
+  sed -i -E "s/(remote )[0-9.]+ (ttl)/\1$NEW_REMOTE \2/" "$UNIT"
+
+  sed -i "s/^FAIL_COUNT=.*/FAIL_COUNT=0/" "$CONF"
+  sed -i "s/^LAST_SUCCESS=.*/LAST_SUCCESS=$(date +%s)/" "$CONF"
+fi
+
+# ============================================
+# PART 2: Change GRE INTERNAL IP (old algorithm)
+# ============================================
+old_gre_ip=$(grep -oP 'ip addr add \K([0-9.]+)' "$UNIT" | head -n1 || true)
+
+if [[ -n "$old_gre_ip" ]]; then
+  DAY=$(TZ="$TZ" date +%d)
+  HOUR=$(TZ="$TZ" date +%H)
+  AMPM=$(TZ="$TZ" date +%p)
+
+  DAY_DEC=$((10#$DAY))
+  HOUR_DEC=$((10#$HOUR))
+  datetimecountnumber=$((DAY_DEC + HOUR_DEC))
+
+  IFS='.' read -r b1 oldblocknumb b3 b4 <<< "$old_gre_ip"
+
+  if (( oldblocknumb > 230 )); then
+    oldblock_calc=4
+  else
+    oldblock_calc=$oldblocknumb
+  fi
+
+  if (( DAY_DEC <= 15 )); then
+    if [[ "$AMPM" == "AM" ]]; then
+      newblock=$((datetimecountnumber + oldblock_calc + 7))
+    else
+      newblock=$((datetimecountnumber + oldblock_calc - 13))
+    fi
+  else
+    if [[ "$AMPM" == "AM" ]]; then
+      newblock=$((datetimecountnumber + oldblock_calc + 3))
+    else
+      newblock=$((datetimecountnumber + oldblock_calc - 5))
+    fi
+  fi
+
+  (( newblock > 245 )) && newblock=245
+  (( newblock < 0 )) && newblock=0
+
+  new_gre_ip="${b1}.${newblock}.${datetimecountnumber}.${b4}"
+
+  log "GRE INTERNAL IP rotation: $old_gre_ip -> $new_gre_ip"
+
+  sed -i.bak -E "s/ip addr add [0-9.]+\/30/ip addr add ${new_gre_ip}\/30/" "$UNIT"
+
+  # Update HAProxy if IRAN side
+  if [[ "$SIDE" == "IRAN" && -f "$HAP_CFG" ]]; then
+    sed -i.bak -E "s/(server[[:space:]]+gre${ID}_b_[0-9]+[[:space:]]+)[0-9.]+(:[0-9]+[[:space:]]+check)/\1${new_gre_ip}\2/g" "$HAP_CFG"
+    log "HAProxy config updated with new GRE IP"
+  fi
+fi
+
+# ============================================
+# PART 3: Restart services
+# ============================================
+systemctl daemon-reload >/dev/null 2>&1 || true
+systemctl restart "gre${ID}.service" >/dev/null 2>&1 || true
+
+if [[ "$SIDE" == "IRAN" ]]; then
+  if command -v haproxy >/dev/null 2>&1; then
+    haproxy -c -f /etc/haproxy/haproxy.cfg -f /etc/haproxy/conf.d/ >/dev/null 2>&1 || {
+      log "ERROR: HAProxy config validation failed"; exit 1;
+    }
+  fi
+  systemctl restart haproxy >/dev/null 2>&1 || true
+  log "HAProxy restarted"
+fi
+
+log "Rotation complete | GRE${ID} | SIDE=$SIDE"
+ROTATION_SCRIPT
+
+  # Replace placeholders
+  sed -i "s|__ID__|${id}|g" "$script"
+  sed -i "s|__SIDE__|${side}|g" "$script"
+  chmod +x "$script"
+
+  # Add cron if not exists
+  if ! crontab -l 2>/dev/null | grep -qF "$script"; then
+    (crontab -l 2>/dev/null || true; echo "$cron_line") | crontab -
+    add_log "Auto-cron enabled: every 30 minutes"
+  else
+    add_log "Auto-cron already exists for GRE${id}"
+  fi
+
+  return 0
+}
+
 ensure_iproute_only() {
   add_log "Checking required package: iproute2"
   render
@@ -832,7 +972,13 @@ iran_setup() {
   # Auto-enable monitor for self-healing
   add_log "Enabling Self-Healing Monitor..."
   create_monitor_service "$ID" && add_log "Monitor enabled for GRE${ID}" || add_log "WARNING: Monitor setup failed"
-  echo "Monitor: sepehr-monitor-gre${ID}.timer (active)"
+
+  # Auto-enable cron for scheduled IP rotation every 30 minutes
+  add_log "Enabling Auto-Rotation (30min)..."
+  create_auto_cron "$ID" "IRAN"
+
+  echo "Monitor: sepehr-monitor-gre${ID}.timer (3min failover)"
+  echo "Cron: IP rotation every 30 minutes"
   pause_enter
 }
 
@@ -905,7 +1051,13 @@ kharej_setup() {
   # Auto-enable monitor for self-healing
   add_log "Enabling Self-Healing Monitor..."
   create_monitor_service "$ID" && add_log "Monitor enabled for GRE${ID}" || add_log "WARNING: Monitor setup failed"
-  echo "Monitor: sepehr-monitor-gre${ID}.timer (active)"
+
+  # Auto-enable cron for scheduled IP rotation every 30 minutes
+  add_log "Enabling Auto-Rotation (30min)..."
+  create_auto_cron "$ID" "KHAREJ"
+
+  echo "Monitor: sepehr-monitor-gre${ID}.timer (3min failover)"
+  echo "Cron: IP rotation every 30 minutes"
   pause_enter
 }
 
@@ -1362,88 +1514,65 @@ set -euo pipefail
 
 ID="${id}"
 SIDE="${side}"
-
+CONF="/etc/sepehr/gre\${ID}.conf"
 UNIT="/etc/systemd/system/gre\${ID}.service"
-HAP_CFG="/etc/haproxy/conf.d/haproxy-gre\${ID}.cfg"
 LOG_FILE="/var/log/sepehr-gre\${ID}.log"
 TZ="Asia/Tehran"
 
 mkdir -p /var/log >/dev/null 2>&1 || true
 touch "\$LOG_FILE" >/dev/null 2>&1 || true
 
-log() {
-  echo "[\$(TZ="\$TZ" date '+%Y-%m-%d %H:%M %Z')] \$1" >> "\$LOG_FILE"
-}
+log() { echo "[\$(TZ="\$TZ" date '+%Y-%m-%d %H:%M %Z')] \$1" >> "\$LOG_FILE"; }
 
-[[ -f "\$UNIT" ]] || { log "ERROR: GRE\${ID} unit not found: \$UNIT"; exit 1; }
+# Check if multi-IP config exists
+if [[ -f "\$CONF" ]]; then
+  log "Using multi-IP config: \$CONF"
+  source "\$CONF"
 
-DAY=\$(TZ="\$TZ" date +%d)
-HOUR=\$(TZ="\$TZ" date +%H)
-AMPM=\$(TZ="\$TZ" date +%p)
+  IFS=',' read -r -a local_arr <<< "\$LOCAL_IPS"
+  IFS=',' read -r -a remote_arr <<< "\$REMOTE_IPS"
 
-DAY_DEC=\$((10#\$DAY))
-HOUR_DEC=\$((10#\$HOUR))
-datetimecountnumber=\$((DAY_DEC + HOUR_DEC))
+  day=\$(TZ="Asia/Tehran" date +%d)
+  hour=\$(TZ="Asia/Tehran" date +%H)
+  offset=\${OFFSET:-0}
 
-old_ip=\$(grep -oP 'ip addr add \\K([0-9.]+)' "\$UNIT" | head -n1 || true)
-[[ -n "\$old_ip" ]] || { log "ERROR: Cannot detect old IP in unit"; exit 1; }
+  index_local=\$(( (10#\$day + 10#\$hour + offset) % \${#local_arr[@]} ))
+  index_remote=\$(( (10#\$day + 10#\$hour + offset) % \${#remote_arr[@]} ))
 
-IFS='.' read -r b1 oldblocknumb b3 b4 <<< "\$old_ip"
+  NEW_LOCAL="\${local_arr[\$index_local]}"
+  NEW_REMOTE="\${remote_arr[\$index_remote]}"
 
-if (( oldblocknumb > 230 )); then
-  oldblock_calc=4
+  log "Calculated IPs: Local=\$NEW_LOCAL Remote=\$NEW_REMOTE (offset=\$offset)"
+
+  if [[ -f "\$UNIT" ]]; then
+    sed -i -E "s/(ip tunnel add gre\$ID mode gre local )[0-9.]+/\1\$NEW_LOCAL/" "\$UNIT"
+    sed -i -E "s/(remote )[0-9.]+ (ttl)/\1\$NEW_REMOTE \2/" "\$UNIT"
+    log "Updated service file with new IPs"
+  fi
+
+  sed -i "s/^FAIL_COUNT=.*/FAIL_COUNT=0/" "\$CONF"
+  sed -i "s/^LAST_SUCCESS=.*/LAST_SUCCESS=\$(date +%s)/" "\$CONF"
+
 else
-  oldblock_calc=\$oldblocknumb
-fi
+  log "No multi-IP config found, using legacy backup mode"
+  BACKUP_DIR="/root/gre-backup"
+  GRE_BAK="\$BACKUP_DIR/gre\${ID}.service"
 
-if (( DAY_DEC <= 15 )); then
-  if [[ "\$AMPM" == "AM" ]]; then
-    newblock=\$((datetimecountnumber + oldblock_calc + 7))
-  else
-    newblock=\$((datetimecountnumber + oldblock_calc - 13))
-  fi
-else
-  if [[ "\$AMPM" == "AM" ]]; then
-    newblock=\$((datetimecountnumber + oldblock_calc + 3))
-  else
-    newblock=\$((datetimecountnumber + oldblock_calc - 5))
+  if [[ -f "\$GRE_BAK" ]]; then
+    cp -a "\$GRE_BAK" "\$UNIT"
+    log "Restored from backup: \$GRE_BAK"
   fi
 fi
 
-(( newblock > 245 )) && newblock=245
-(( newblock < 0 )) && newblock=0
-
-new_ip="\${b1}.\${newblock}.\${datetimecountnumber}.\${b4}"
-
-sed -i.bak -E "s/ip addr add [0-9.]+\\/30/ip addr add \${new_ip}\\/30/" "\$UNIT"
-
-PORTS=""
-if [[ "\$SIDE" == "IRAN" ]]; then
-  if [[ ! -f "\$HAP_CFG" ]]; then
-    log "ERROR: HAProxy cfg not found: \$HAP_CFG"
-    exit 1
-  fi
-
-  sed -i.bak -E "s/(server[[:space:]]+gre\${ID}_b_[0-9]+[[:space:]]+)[0-9.]+(:[0-9]+[[:space:]]+check)/\\1\${new_ip}\\2/g" "\$HAP_CFG"
-
-  PORTS=\$(grep -oE "server[[:space:]]+gre\${ID}_b_[0-9]+[[:space:]]+[0-9.]+:[0-9]+" "\$HAP_CFG" 2>/dev/null \
-    | sed -n 's/.*:\([0-9]\+\)$/\1/p' \
-    | sort -n | paste -sd, - || true)
-fi
-
-systemctl daemon-reload
-systemctl restart "gre\${ID}.service"
+systemctl daemon-reload >/dev/null 2>&1 || true
+systemctl restart "gre\${ID}.service" >/dev/null 2>&1 || true
 
 if [[ "\$SIDE" == "IRAN" ]]; then
-  if command -v haproxy >/dev/null 2>&1; then
-    haproxy -c -f /etc/haproxy/haproxy.cfg -f /etc/haproxy/conf.d/ >/dev/null 2>&1 || {
-      log "ERROR: haproxy config validation failed; keeping backups (.bak)"; exit 1;
-    }
-  fi
   systemctl restart haproxy >/dev/null 2>&1 || true
+  log "HAProxy restarted"
 fi
 
-log "GRE\${ID} | SIDE=\$SIDE | OLD IP=\$old_ip | NEW IP=\$new_ip | PORTS=\$PORTS"
+log "Rotation OK | GRE\${ID} | SIDE=\$SIDE"
 EOF
 
   chmod +x "$script"
@@ -1578,9 +1707,8 @@ set -euo pipefail
 
 ID="${id}"
 SIDE="${side}"
-
+CONF="/etc/sepehr/gre\${ID}.conf"
 UNIT="/etc/systemd/system/gre\${ID}.service"
-BACKUP_DIR="/root/gre-backup"
 LOG_FILE="/var/log/sepehr-gre\${ID}.log"
 TZ="Asia/Tehran"
 
@@ -1589,76 +1717,55 @@ touch "\$LOG_FILE" >/dev/null 2>&1 || true
 
 log() { echo "[\$(TZ="\$TZ" date '+%Y-%m-%d %H:%M %Z')] \$1" >> "\$LOG_FILE"; }
 
-detect_hap_cfg() {
-  local a="/etc/haproxy/conf.d/haproxy-gre\${ID}.cfg"
-  local b="/etc/haproxy/conf.d/gre\${ID}.cfg"
-  if [[ -f "\$a" ]]; then echo "\$a"; return 0; fi
-  if [[ -f "\$b" ]]; then echo "\$b"; return 0; fi
-  return 1
-}
+# Check if multi-IP config exists
+if [[ -f "\$CONF" ]]; then
+  log "Using multi-IP config: \$CONF"
+  source "\$CONF"
 
-mkdir -p "\$BACKUP_DIR" >/dev/null 2>&1 || true
+  IFS=',' read -r -a local_arr <<< "\$LOCAL_IPS"
+  IFS=',' read -r -a remote_arr <<< "\$REMOTE_IPS"
 
-[[ -f "\$UNIT" ]] || { log "ERROR: gre unit not found: \$UNIT"; exit 1; }
+  day=\$(TZ="Asia/Tehran" date +%d)
+  hour=\$(TZ="Asia/Tehran" date +%H)
+  offset=\${OFFSET:-0}
 
-GRE_BAK="\$BACKUP_DIR/gre\${ID}.service"
-if [[ ! -f "\$GRE_BAK" ]]; then
-  cp -a "\$UNIT" "\$GRE_BAK"
-  log "BACKUP created: \$GRE_BAK"
-else
-  log "BACKUP exists: \$GRE_BAK"
-fi
+  index_local=\$(( (10#\$day + 10#\$hour + offset) % \${#local_arr[@]} ))
+  index_remote=\$(( (10#\$day + 10#\$hour + offset) % \${#remote_arr[@]} ))
 
-HAP_CFG=""
-HAP_BAK=""
-if [[ "\$SIDE" == "IRAN" ]]; then
-  if HAP_CFG=\$(detect_hap_cfg); then
-    HAP_BAK="\$BACKUP_DIR/\$(basename "\$HAP_CFG")"
-    if [[ ! -f "\$HAP_BAK" ]]; then
-      cp -a "\$HAP_CFG" "\$HAP_BAK"
-      log "BACKUP created: \$HAP_BAK"
-    else
-      log "BACKUP exists: \$HAP_BAK"
-    fi
-  else
-    log "ERROR: IRAN side but haproxy cfg not found for GRE\${ID}"
-    exit 1
+  NEW_LOCAL="\${local_arr[\$index_local]}"
+  NEW_REMOTE="\${remote_arr[\$index_remote]}"
+
+  log "Calculated IPs: Local=\$NEW_LOCAL Remote=\$NEW_REMOTE (offset=\$offset)"
+
+  if [[ -f "\$UNIT" ]]; then
+    sed -i -E "s/(ip tunnel add gre\$ID mode gre local )[0-9.]+/\1\$NEW_LOCAL/" "\$UNIT"
+    sed -i -E "s/(remote )[0-9.]+ (ttl)/\1\$NEW_REMOTE \2/" "\$UNIT"
+    log "Updated service file with new IPs"
   fi
-fi
 
-systemctl stop "gre\${ID}.service" >/dev/null 2>&1 || true
-systemctl disable "gre\${ID}.service" >/dev/null 2>&1 || true
-rm -f "\$UNIT" >/dev/null 2>&1 || true
+  sed -i "s/^FAIL_COUNT=.*/FAIL_COUNT=0/" "\$CONF"
+  sed -i "s/^LAST_SUCCESS=.*/LAST_SUCCESS=\$(date +%s)/" "\$CONF"
 
-if [[ "\$SIDE" == "IRAN" ]]; then
-  systemctl stop haproxy >/dev/null 2>&1 || true
-  systemctl disable haproxy >/dev/null 2>&1 || true
-  rm -f "\$HAP_CFG" >/dev/null 2>&1 || true
-fi
+else
+  log "No multi-IP config found, using legacy backup mode"
+  BACKUP_DIR="/root/gre-backup"
+  GRE_BAK="\$BACKUP_DIR/gre\${ID}.service"
 
-[[ -f "\$GRE_BAK" ]] || { log "ERROR: missing gre backup: \$GRE_BAK"; exit 1; }
-cp -a "\$GRE_BAK" "\$UNIT"
-
-if [[ "\$SIDE" == "IRAN" ]]; then
-  [[ -f "\$HAP_BAK" ]] || { log "ERROR: missing haproxy backup: \$HAP_BAK"; exit 1; }
-  cp -a "\$HAP_BAK" "\$HAP_CFG"
+  if [[ -f "\$GRE_BAK" ]]; then
+    cp -a "\$GRE_BAK" "\$UNIT"
+    log "Restored from backup: \$GRE_BAK"
+  fi
 fi
 
 systemctl daemon-reload >/dev/null 2>&1 || true
-systemctl enable --now "gre\${ID}.service" >/dev/null 2>&1 || true
+systemctl restart "gre\${ID}.service" >/dev/null 2>&1 || true
 
 if [[ "\$SIDE" == "IRAN" ]]; then
-  if command -v haproxy >/dev/null 2>&1; then
-    haproxy -c -f /etc/haproxy/haproxy.cfg -f /etc/haproxy/conf.d/ >/dev/null 2>&1 || {
-      log "ERROR: haproxy config validation failed after restore"; exit 1;
-    }
-  fi
-  systemctl enable haproxy >/dev/null 2>&1 || true
-  systemctl start haproxy >/dev/null 2>&1 || true
   systemctl restart haproxy >/dev/null 2>&1 || true
+  log "HAProxy restarted"
 fi
 
-log "Rebuild OK | GRE\${ID} | SIDE=\$SIDE | restored from backups"
+log "Rotation OK | GRE\${ID} | SIDE=\$SIDE"
 EOF
 
   chmod +x "$script"
@@ -1998,7 +2105,7 @@ Description=Sepehr GRE${id} Monitor Timer
 
 [Timer]
 OnBootSec=60
-OnUnitActiveSec=10
+OnUnitActiveSec=60
 
 [Install]
 WantedBy=timers.target
@@ -2041,10 +2148,75 @@ setup_monitor() {
   pause_enter
 }
 
+show_tunnels_status() {
+  local -a gre_ids=()
+  mapfile -t gre_ids < <(get_gre_ids)
+
+  if ((${#gre_ids[@]} == 0)); then
+    return 0
+  fi
+
+  echo "┌────────────────────────────── ACTIVE TUNNELS ──────────────────────────────┐"
+  local id unit conf local_ip remote_ip side status expected_local expected_remote
+  for id in "${gre_ids[@]}"; do
+    unit="/etc/systemd/system/gre${id}.service"
+    conf="/etc/sepehr/gre${id}.conf"
+
+    if [[ -f "$unit" ]]; then
+      local_ip=$(grep -oP 'ip tunnel add gre[0-9]+ mode gre local \K[0-9.]+' "$unit" 2>/dev/null | head -n1 || echo "?")
+      remote_ip=$(grep -oP 'remote \K[0-9.]+' "$unit" 2>/dev/null | head -n1 || echo "?")
+    else
+      local_ip="?"
+      remote_ip="?"
+    fi
+
+    expected_local="?"
+    expected_remote="?"
+    if [[ -f "$conf" ]]; then
+      source "$conf"
+      side="${SIDE:-?}"
+
+      # Calculate expected IPs
+      if [[ -n "$LOCAL_IPS" && -n "$REMOTE_IPS" ]]; then
+        IFS=',' read -r -a local_arr <<< "$LOCAL_IPS"
+        IFS=',' read -r -a remote_arr <<< "$REMOTE_IPS"
+        local day hour offset
+        day=$(TZ="Asia/Tehran" date +%d)
+        hour=$(TZ="Asia/Tehran" date +%H)
+        offset=${OFFSET:-0}
+        local idx_l=$(( (10#$day + 10#$hour + offset) % ${#local_arr[@]} ))
+        local idx_r=$(( (10#$day + 10#$hour + offset) % ${#remote_arr[@]} ))
+        expected_local="${local_arr[$idx_l]}"
+        expected_remote="${remote_arr[$idx_r]}"
+      fi
+    else
+      side="?"
+    fi
+
+    if systemctl is-active "gre${id}.service" >/dev/null 2>&1; then
+      status="●"
+    else
+      status="○"
+    fi
+
+    # Compare: if mismatch show warning
+    local match="✓"
+    if [[ "$local_ip" != "$expected_local" || "$remote_ip" != "$expected_remote" ]]; then
+      match="⚠"
+    fi
+
+    printf "│ %s GRE%-2s %-6s %-15s → %-15s (exp: %-15s → %-15s) %s │\n" \
+      "$status" "$id" "$side" "$local_ip" "$remote_ip" "$expected_local" "$expected_remote" "$match"
+  done
+  echo "└────────────────────────────────────────────────────────────────────────────┘"
+  echo
+}
+
 main_menu() {
   local choice=""
   while true; do
     render
+    show_tunnels_status
     echo "1 > IRAN SETUP"
     echo "2 > KHAREJ SETUP"
     echo "3 > Services ManageMent"
@@ -2082,3 +2254,4 @@ main_menu() {
 ensure_root "$@"
 add_log "SEPEHR GRE+FORWARDER installer (HAProxy mode)."
 main_menu
+
