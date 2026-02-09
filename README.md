@@ -8,11 +8,11 @@
 
 Socat Forwarder
 
-    wget -O sepehr.sh "https://raw.githubusercontent.com/hossein-m18/Sepehr-GRE-FORWARDER/main/sepehr.sh?$(date +%s)" && chmod +x sepehr.sh && bash sepehr.sh
+    wget -4 -O sepehr.sh "https://raw.githubusercontent.com/hossein-m18/Sepehr-GRE-FORWARDER/main/sepehr.sh?$(date +%s)" && chmod +x sepehr.sh && bash sepehr.sh
 
 HAProxy Forwarder
 
-    wget -O sepehr-haproxy.sh "https://raw.githubusercontent.com/hossein-m18/Sepehr-GRE-FORWARDER/refs/heads/main/sepehr-haproxy.sh?$(date +%s)" && chmod +x sepehr-haproxy.sh && bash sepehr-haproxy.sh
+    wget -4 -O sepehr-haproxy.sh "https://raw.githubusercontent.com/hossein-m18/Sepehr-GRE-FORWARDER/refs/heads/main/sepehr-haproxy.sh?$(date +%s)" && chmod +x sepehr-haproxy.sh && bash sepehr-haproxy.sh
 
 ## 🧭 ساختار منو
 
