@@ -2173,16 +2173,20 @@ show_tunnels_status() {
       gre_local_ip="?"
     fi
 
-    # Get side and calculate peer GRE IP
+    # Get side and calculate peer GRE IP based on actual local GRE IP
     gre_remote_ip="?"
     if [[ -f "$conf" ]]; then
       source "$conf"
       side="${SIDE:-?}"
-      if [[ -n "$GRE_BASE" ]]; then
+      # Calculate peer from actual local GRE IP (change last octet)
+      if [[ "$gre_local_ip" != "?" ]]; then
+        local gre_prefix="${gre_local_ip%.*}"
         if [[ "$side" == "IRAN" ]]; then
-          gre_remote_ip="${GRE_BASE%.*}.2"
+          # IRAN is .1, peer (KHAREJ) is .2
+          gre_remote_ip="${gre_prefix}.2"
         else
-          gre_remote_ip="${GRE_BASE%.*}.1"
+          # KHAREJ is .2, peer (IRAN) is .1
+          gre_remote_ip="${gre_prefix}.1"
         fi
       fi
     else
