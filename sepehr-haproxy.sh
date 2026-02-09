@@ -537,6 +537,8 @@ log() { echo "[$(TZ="$TZ" date '+%Y-%m-%d %H:%M %Z')] $1" >> "$LOG_FILE"; }
 
 # ============================================
 # PART 1: Change PUBLIC IPs (multi-IP system)
+# NOTE: NO OFFSET used here! Both sides must select same IPs.
+# Only DAY+HOUR is used so both sides are always in sync.
 # ============================================
 if [[ -f "$CONF" ]]; then
   source "$CONF"
@@ -546,15 +548,15 @@ if [[ -f "$CONF" ]]; then
 
   day=$(TZ="Asia/Tehran" date +%d)
   hour=$(TZ="Asia/Tehran" date +%H)
-  offset=${OFFSET:-0}
 
-  index_local=$(( (10#$day + 10#$hour + offset) % ${#local_arr[@]} ))
-  index_remote=$(( (10#$day + 10#$hour + offset) % ${#remote_arr[@]} ))
+  # NO OFFSET for public IPs - ensures both sides select same IPs
+  index_local=$(( (10#$day + 10#$hour) % ${#local_arr[@]} ))
+  index_remote=$(( (10#$day + 10#$hour) % ${#remote_arr[@]} ))
 
   NEW_LOCAL="${local_arr[$index_local]}"
   NEW_REMOTE="${remote_arr[$index_remote]}"
 
-  log "PUBLIC IP rotation: Local=$NEW_LOCAL Remote=$NEW_REMOTE (offset=$offset)"
+  log "PUBLIC IP rotation: Local=$NEW_LOCAL Remote=$NEW_REMOTE (day=$day hour=$hour)"
 
   sed -i -E "s/(ip tunnel add gre$ID mode gre local )[0-9.]+/\1$NEW_LOCAL/" "$UNIT"
   sed -i -E "s/(remote )[0-9.]+ (ttl)/\1$NEW_REMOTE \2/" "$UNIT"
