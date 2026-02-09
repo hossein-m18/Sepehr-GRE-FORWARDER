@@ -116,6 +116,58 @@ ipv4_set_last_octet() {
   echo "${a}.${b}.${c}.${last}"
 }
 
+get_server_ips() {
+  local -a ips=()
+  local ip
+  while IFS= read -r ip; do
+    [[ -n "$ip" ]] && ips+=("$ip")
+  done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d'/' -f1 | sort -u)
+  printf '%s\n' "${ips[@]}"
+}
+
+select_local_ip() {
+  local prompt="$1" __var="$2"
+  local -a SERVER_IPS=()
+  mapfile -t SERVER_IPS < <(get_server_ips)
+
+  if ((${#SERVER_IPS[@]} == 0)); then
+    add_log "ERROR: No public IPs detected on this server."
+    return 1
+  fi
+
+  local choice
+  while true; do
+    render
+    echo "$prompt"
+    echo
+    local i
+    for ((i=0; i<${#SERVER_IPS[@]}; i++)); do
+      printf "%d) %s\n" $((i+1)) "${SERVER_IPS[$i]}"
+    done
+    echo "0) Enter manually"
+    echo
+    read -r -e -p "Select: " choice
+    choice="$(trim "$choice")"
+
+    if [[ "$choice" == "0" ]]; then
+      local manual_ip
+      ask_until_valid "Enter IP manually:" valid_ipv4 manual_ip
+      printf -v "$__var" '%s' "$manual_ip"
+      add_log "Selected (manual): $manual_ip"
+      return 0
+    fi
+
+    if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice>=1 && choice<=${#SERVER_IPS[@]})); then
+      local selected_ip="${SERVER_IPS[$((choice-1))]}"
+      printf -v "$__var" '%s' "$selected_ip"
+      add_log "Selected: $selected_ip"
+      return 0
+    fi
+
+    add_log "Invalid selection: $choice"
+  done
+}
+
 ask_until_valid() {
   local prompt="$1" validator="$2" __var="$3"
   local ans=""
@@ -420,8 +472,8 @@ iran_setup() {
   local -a PORT_LIST=()
 
   ask_until_valid "GRE Number :" is_int ID
-  ask_until_valid "IRAN IP :" valid_ipv4 IRANIP
-  ask_until_valid "KHAREJ IP :" valid_ipv4 KHAREJIP
+  select_local_ip "Select IRAN IP (local server):" IRANIP || { die_soft "Failed to select local IP."; return 0; }
+  ask_until_valid "KHAREJ IP (remote server):" valid_ipv4 KHAREJIP
   ask_until_valid "GRE IP RANG (Example : 10.80.70.0):" valid_gre_base GREBASE
   ask_ports
 
@@ -504,8 +556,8 @@ kharej_setup() {
   local use_mtu="n" MTU_VALUE=""
 
   ask_until_valid "GRE Number(Like IRAN PLEASE) :" is_int ID
-  ask_until_valid "KHAREJ IP :" valid_ipv4 KHAREJIP
-  ask_until_valid "IRAN IP :" valid_ipv4 IRANIP
+  select_local_ip "Select KHAREJ IP (local server):" KHAREJIP || { die_soft "Failed to select local IP."; return 0; }
+  ask_until_valid "IRAN IP (remote server):" valid_ipv4 IRANIP
   ask_until_valid "GRE IP RANG (Example : 10.80.70.0) Like IRAN PLEASE:" valid_gre_base GREBASE
 
   while true; do
@@ -1375,6 +1427,90 @@ change_mtu() {
 }
 
 
+edit_tunnel_ips() {
+  local id
+
+  mapfile -t GRE_IDS < <(get_gre_ids)
+  local -a GRE_LABELS=()
+  for id in "${GRE_IDS[@]}"; do GRE_LABELS+=("GRE${id}"); done
+
+  if ! menu_select_index "Edit Tunnel IPs" "Select GRE:" "${GRE_LABELS[@]}"; then
+    return 0
+  fi
+  id="${GRE_IDS[$MENU_SELECTED]}"
+
+  local unit="/etc/systemd/system/gre${id}.service"
+  if [[ ! -f "$unit" ]]; then
+    die_soft "Unit file not found: $unit"
+    return 0
+  fi
+
+  local old_local old_remote
+  old_local=$(grep -oP 'ip tunnel add gre[0-9]+ mode gre local \K[0-9.]+' "$unit" | head -n1)
+  old_remote=$(grep -oP 'remote \K[0-9.]+' "$unit" | head -n1)
+
+  add_log "Current: Local=${old_local} Remote=${old_remote}"
+  render
+
+  local what_to_edit
+  while true; do
+    render
+    echo "Edit Tunnel GRE${id}"
+    echo "Current: Local=${old_local} | Remote=${old_remote}"
+    echo
+    echo "1) Change Local IP (this server)"
+    echo "2) Change Remote IP (other server)"
+    echo "3) Change Both"
+    echo "0) Back"
+    echo
+    read -r -e -p "Select: " what_to_edit
+    what_to_edit="$(trim "$what_to_edit")"
+    case "$what_to_edit" in
+      1|2|3) break ;;
+      0) return 0 ;;
+      *) add_log "Invalid selection" ;;
+    esac
+  done
+
+  local new_local="$old_local" new_remote="$old_remote"
+
+  if [[ "$what_to_edit" == "1" || "$what_to_edit" == "3" ]]; then
+    select_local_ip "Select NEW Local IP:" new_local || { die_soft "Failed to select local IP."; return 0; }
+  fi
+
+  if [[ "$what_to_edit" == "2" || "$what_to_edit" == "3" ]]; then
+    ask_until_valid "Enter NEW Remote IP:" valid_ipv4 new_remote
+  fi
+
+  add_log "Updating: Local ${old_local} -> ${new_local} | Remote ${old_remote} -> ${new_remote}"
+  render
+
+  sed -i.bak -E "s/(ip tunnel add gre${id} mode gre local )[0-9.]+/\\1${new_local}/" "$unit"
+  sed -i -E "s/(remote )[0-9.]+ (ttl)/\\1${new_remote} \\2/" "$unit"
+
+  local backup="/root/gre-backup/gre${id}.service"
+  if [[ -f "$backup" ]]; then
+    add_log "Updating backup: $backup"
+    sed -i.bak -E "s/(ip tunnel add gre${id} mode gre local )[0-9.]+/\\1${new_local}/" "$backup"
+    sed -i -E "s/(remote )[0-9.]+ (ttl)/\\1${new_remote} \\2/" "$backup"
+  fi
+
+  add_log "Reloading systemd..."
+  systemctl daemon-reload >/dev/null 2>&1 || true
+
+  add_log "Restarting gre${id}.service..."
+  systemctl restart "gre${id}.service" >/dev/null 2>&1 || add_log "WARNING: restart failed"
+
+  add_log "Done: GRE${id} IPs updated."
+  render
+  echo "GRE${id} Updated:"
+  echo "  Local : ${old_local} -> ${new_local}"
+  echo "  Remote: ${old_remote} -> ${new_remote}"
+  echo
+  show_unit_status_brief "gre${id}.service"
+  pause_enter
+}
+
 main_menu() {
   local choice=""
   while true; do
@@ -1387,6 +1523,7 @@ main_menu() {
 	echo "6 > Rebuild Automation"
 	echo "7 > Regenerate Automation"
 	echo "8 > Change MTU"
+	echo "9 > Edit Tunnel IPs"
     echo "0 > Exit"
     echo
     read -r -e -p "Select option: " choice
@@ -1401,6 +1538,7 @@ main_menu() {
 	  6) add_log "Selected: Rebuild Automation"; recreate_automation_mode ;;
 	  7) add_log "Selected: Regenerate Automation"; recreate_automation ;;
 	  8) add_log "Selected: change mtu"; change_mtu ;;
+	  9) add_log "Selected: Edit Tunnel IPs"; edit_tunnel_ips ;;
       0) add_log "Bye!"; render; exit 0 ;;
       *) add_log "Invalid option: $choice" ;;
     esac
