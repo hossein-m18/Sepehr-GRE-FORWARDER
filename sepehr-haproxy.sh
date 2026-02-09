@@ -25,61 +25,61 @@ EOF
 }
 
 add_log() {
-  local msg="$1"
-  local ts
-  ts="$(date +"%H:%M:%S")"
-  LOG_LINES+=("[$ts] $msg")
-  if ((${#LOG_LINES[@]} > LOG_MAX)); then
-    LOG_LINES=("${LOG_LINES[@]: -$LOG_MAX}")
-  fi
+    local msg="$1"
+    local ts
+    ts="$(date +"%H:%M:%S")"
+    LOG_LINES+=("[$ts] $msg")
+    if ((${#LOG_LINES[@]} > LOG_MAX)); then
+        LOG_LINES=("${LOG_LINES[@]: -$LOG_MAX}")
+    fi
 }
 
 render() {
-  clear
-  banner
-  echo
-  local shown_count="${#LOG_LINES[@]}"
-  local height=$shown_count
-  ((height < LOG_MIN)) && height=$LOG_MIN
-  ((height > LOG_MAX)) && height=$LOG_MAX
-
-  echo "┌───────────────────────────── ACTION LOG ─────────────────────────────┐"
-  local start_index=0
-  if ((${#LOG_LINES[@]} > height)); then
-    start_index=$((${#LOG_LINES[@]} - height))
-  fi
-
-  local i line
-  for ((i=start_index; i<${#LOG_LINES[@]}; i++)); do
-    line="${LOG_LINES[$i]}"
-    printf "│ %-68s │\n" "$line"
-  done
-
-  local missing=$((height - (${#LOG_LINES[@]} - start_index)))
-  for ((i=0; i<missing; i++)); do
-    printf "│ %-68s │\n" ""
-  done
-
-  echo "└──────────────────────────────────────────────────────────────────────┘"
-  echo
+    clear
+    banner
+    echo
+    local shown_count="${#LOG_LINES[@]}"
+    local height=$shown_count
+    ((height < LOG_MIN)) && height=$LOG_MIN
+    ((height > LOG_MAX)) && height=$LOG_MAX
+    
+    echo "┌───────────────────────────── ACTION LOG ─────────────────────────────┐"
+    local start_index=0
+    if ((${#LOG_LINES[@]} > height)); then
+        start_index=$((${#LOG_LINES[@]} - height))
+    fi
+    
+    local i line
+    for ((i=start_index; i<${#LOG_LINES[@]}; i++)); do
+        line="${LOG_LINES[$i]}"
+        printf "│ %-68s │\n" "$line"
+    done
+    
+    local missing=$((height - (${#LOG_LINES[@]} - start_index)))
+    for ((i=0; i<missing; i++)); do
+        printf "│ %-68s │\n" ""
+    done
+    
+    echo "└──────────────────────────────────────────────────────────────────────┘"
+    echo
 }
 
 pause_enter() {
-  echo
-  read -r -p "Press ENTER to return to menu..." _
+    echo
+    read -r -p "Press ENTER to return to menu..." _
 }
 
 die_soft() {
-  add_log "ERROR: $1"
-  render
-  pause_enter
+    add_log "ERROR: $1"
+    render
+    pause_enter
 }
 
 ensure_root() {
-  if [[ $EUID -ne 0 ]]; then
-    echo "This script must be run as root. Re-running with sudo..."
-    exec sudo -E bash "$0" "$@"
-  fi
+    if [[ $EUID -ne 0 ]]; then
+        echo "This script must be run as root. Re-running with sudo..."
+        exec sudo -E bash "$0" "$@"
+    fi
 }
 
 trim() { sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' <<<"$1"; }
@@ -261,9 +261,14 @@ ensure_mtu_line_in_unit() {
 
 
 make_gre_service() {
-  local id="$1" local_ip="$2" remote_ip="$3" local_gre_ip="$4" key="$5"
+  local id="$1" local_ip="$2" remote_ip="$3" local_gre_ip="$4" key="$5" mtu_val="$6"
   local unit="gre${id}.service"
   local path="/etc/systemd/system/${unit}"
+  local mtu_line=""
+
+  if [[ -n "$mtu_val" ]]; then
+    mtu_line="ExecStart=/sbin/ip link set gre${id} mtu ${mtu_val}"
+  fi
 
   if unit_exists "$unit"; then
     add_log "Service already exists: $unit"
@@ -935,56 +940,18 @@ add_tunnel_port() {
 }
 
 select_and_set_timezone() {
-  local choice tz=""
-  while true; do
-    render
-    echo "WARNING: You need set mutual Time to IRAN and Kharej Server"
-    echo "select your server clock"
-    echo
-    echo "1) Germany (Europe/Berlin)"
-    echo "2) Turkey (Europe/Istanbul)"
-    echo "3) France (Europe/Paris)"
-    echo "4) Netherlands (Europe/Amsterdam)"
-    echo "5) Finland (Europe/Helsinki)"
-    echo "6) England (Europe/London)"
-    echo "7) Sweden (Europe/Stockholm)"
-    echo "8) Russia (Europe/Moscow)"
-    echo "9) USA (America/New_York)"
-    echo "10) Canada (America/Toronto)"
-    echo "11) UTC (Etc/UTC)"
-    echo "0) Skip (no change)"
-    echo
+  local tz="Asia/Tehran"
 
-    read -r -p "Select: " choice
-    choice="$(trim "$choice")"
+  add_log "Setting timezone: $tz (locked to Tehran)"
+  render
 
-    case "$choice" in
-      1) tz="Europe/Berlin" ;;
-      2) tz="Europe/Istanbul" ;;
-      3) tz="Europe/Paris" ;;
-      4) tz="Europe/Amsterdam" ;;
-      5) tz="Europe/Helsinki" ;;
-      6) tz="Europe/London" ;;
-      7) tz="Europe/Stockholm" ;;
-      8) tz="Europe/Moscow" ;;
-      9) tz="America/New_York" ;;
-      10) tz="America/Toronto" ;;
-      11) tz="Etc/UTC" ;;
-      0) add_log "Timezone setup skipped."; return 0 ;;
-      *) add_log "Invalid selection: $choice"; continue ;;
-    esac
+  timedatectl set-timezone "$tz" >/dev/null 2>&1 || { add_log "ERROR: failed set-timezone"; return 1; }
+  timedatectl set-ntp true >/dev/null 2>&1 || { add_log "ERROR: failed set-ntp true"; return 1; }
 
-    add_log "Setting timezone: $tz"
-    render
-
-    timedatectl set-timezone "$tz" >/dev/null 2>&1 || { add_log "ERROR: failed set-timezone"; return 1; }
-    timedatectl set-ntp true >/dev/null 2>&1 || { add_log "ERROR: failed set-ntp true"; return 1; }
-
-    local now
-    now="$(TZ="$tz" date '+%Y-%m-%d %H:%M %Z')"
-    add_log "Timezone set OK: $tz | Now: $now"
-    return 0
-  done
+  local now
+  now="$(TZ="$tz" date '+%Y-%m-%d %H:%M %Z')"
+  add_log "Timezone set OK: $tz | Now: $now"
+  return 0
 }
 
 
@@ -1045,7 +1012,7 @@ SIDE="${side}"
 UNIT="/etc/systemd/system/gre\${ID}.service"
 HAP_CFG="/etc/haproxy/conf.d/haproxy-gre\${ID}.cfg"
 LOG_FILE="/var/log/sepehr-gre\${ID}.log"
-TZ="Europe/Berlin"
+TZ="Asia/Tehran"
 
 mkdir -p /var/log >/dev/null 2>&1 || true
 touch "\$LOG_FILE" >/dev/null 2>&1 || true
@@ -1261,7 +1228,7 @@ SIDE="${side}"
 UNIT="/etc/systemd/system/gre\${ID}.service"
 BACKUP_DIR="/root/gre-backup"
 LOG_FILE="/var/log/sepehr-gre\${ID}.log"
-TZ="Europe/Berlin"
+TZ="Asia/Tehran"
 
 mkdir -p /var/log >/dev/null 2>&1 || true
 touch "\$LOG_FILE" >/dev/null 2>&1 || true
