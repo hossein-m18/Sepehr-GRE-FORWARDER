@@ -1846,6 +1846,33 @@ change_mtu() {
 }
 
 
+# Helper: normalize IP list (space or comma separated -> comma separated)
+normalize_ip_list() {
+  local input="$1"
+  local normalized="" ip
+  for ip in $(echo "$input" | tr ',' ' '); do
+    ip="$(trim "$ip")"
+    [[ -z "$ip" ]] && continue
+    if valid_ipv4 "$ip"; then
+      [[ -z "$normalized" ]] && normalized="$ip" || normalized="${normalized},${ip}"
+    fi
+  done
+  echo "$normalized"
+}
+
+# Helper: validate IP list (space or comma separated)
+valid_ip_list() {
+  local input="$1"
+  local count=0 ip
+  for ip in $(echo "$input" | tr ',' ' '); do
+    ip="$(trim "$ip")"
+    [[ -z "$ip" ]] && continue
+    valid_ipv4 "$ip" || return 1
+    ((count++))
+  done
+  ((count > 0))
+}
+
 edit_tunnel_ips() {
   local id
 
@@ -1858,28 +1885,39 @@ edit_tunnel_ips() {
   fi
   id="${GRE_IDS[$MENU_SELECTED]}"
 
-  local unit="/etc/systemd/system/gre${id}.service"
-  if [[ ! -f "$unit" ]]; then
-    die_soft "Unit file not found: $unit"
-    return 0
+  local conf
+  conf="$(sepehr_conf_path "$id")"
+  
+  # Load current config
+  local old_local_ips="" old_remote_ips="" side="IRAN" gre_base="" mtu="1420"
+  if [[ -f "$conf" ]]; then
+    source "$conf"
+    old_local_ips="${LOCAL_IPS:-}"
+    old_remote_ips="${REMOTE_IPS:-}"
+    side="${SIDE:-IRAN}"
+    gre_base="${GRE_BASE:-}"
+    mtu="${MTU:-1420}"
+  else
+    local unit="/etc/systemd/system/gre${id}.service"
+    if [[ -f "$unit" ]]; then
+      old_local_ips=$(grep -oP 'ip tunnel add gre[0-9]+ mode gre local \K[0-9.]+' "$unit" | head -n1)
+      old_remote_ips=$(grep -oP 'remote \K[0-9.]+' "$unit" | head -n1)
+    fi
   fi
-
-  local old_local old_remote
-  old_local=$(grep -oP 'ip tunnel add gre[0-9]+ mode gre local \K[0-9.]+' "$unit" | head -n1)
-  old_remote=$(grep -oP 'remote \K[0-9.]+' "$unit" | head -n1)
-
-  add_log "Current: Local=${old_local} Remote=${old_remote}"
-  render
 
   local what_to_edit
   while true; do
     render
-    echo "Edit Tunnel GRE${id}"
-    echo "Current: Local=${old_local} | Remote=${old_remote}"
-    echo
-    echo "1) Change Local IP (this server)"
-    echo "2) Change Remote IP (other server)"
-    echo "3) Change Both"
+    echo "═══════════════════════════════════════════════════════"
+    echo "         Edit Tunnel IPs - GRE${id}"
+    echo "═══════════════════════════════════════════════════════"
+    echo "  SIDE: ${side}"
+    echo "  Current LOCAL IPs  : ${old_local_ips:-none}"
+    echo "  Current REMOTE IPs : ${old_remote_ips:-none}"
+    echo "───────────────────────────────────────────────────────"
+    echo "1) Edit Local IPs (this server)"
+    echo "2) Edit Remote IPs (other server)"
+    echo "3) Edit Both"
     echo "0) Back"
     echo
     read -r -e -p "Select: " what_to_edit
@@ -1891,50 +1929,103 @@ edit_tunnel_ips() {
     esac
   done
 
-  local new_local="$old_local" new_remote="$old_remote"
+  local new_local_ips="$old_local_ips" new_remote_ips="$old_remote_ips"
 
   if [[ "$what_to_edit" == "1" || "$what_to_edit" == "3" ]]; then
-    select_local_ip "Select NEW Local IP:" new_local || { die_soft "Failed to select local IP."; return 0; }
+    render
+    echo "Enter Local IPs (space or comma separated):"
+    echo "Example: 1.2.3.4 5.6.7.8  or  1.2.3.4,5.6.7.8"
+    echo "Current: ${old_local_ips}"
+    echo
+    local input_local
+    while true; do
+      read -r -e -p "Local IPs: " input_local
+      if valid_ip_list "$input_local"; then
+        new_local_ips="$(normalize_ip_list "$input_local")"
+        break
+      else
+        echo "Invalid IP list. Enter valid IPv4 addresses."
+      fi
+    done
   fi
 
   if [[ "$what_to_edit" == "2" || "$what_to_edit" == "3" ]]; then
-    ask_until_valid "Enter NEW Remote IP:" valid_ipv4 new_remote
+    render
+    echo "Enter Remote IPs (space or comma separated):"
+    echo "Example: 1.2.3.4 5.6.7.8  or  1.2.3.4,5.6.7.8"
+    echo "Current: ${old_remote_ips}"
+    echo
+    local input_remote
+    while true; do
+      read -r -e -p "Remote IPs: " input_remote
+      if valid_ip_list "$input_remote"; then
+        new_remote_ips="$(normalize_ip_list "$input_remote")"
+        break
+      else
+        echo "Invalid IP list. Enter valid IPv4 addresses."
+      fi
+    done
   fi
 
-  add_log "Updating: Local ${old_local} -> ${new_local} | Remote ${old_remote} -> ${new_remote}"
+  # Count IPs for TOTAL_PATHS
+  local -a local_arr remote_arr
+  IFS=',' read -ra local_arr <<< "$new_local_ips"
+  IFS=',' read -ra remote_arr <<< "$new_remote_ips"
+  local local_count=${#local_arr[@]}
+  local remote_count=${#remote_arr[@]}
+  local total_paths=$((local_count * remote_count))
+
+  add_log "Updating: ${local_count} local × ${remote_count} remote = ${total_paths} paths"
   render
 
-  sed -i.bak -E "s/(ip tunnel add gre${id} mode gre local )[0-9.]+/\\1${new_local}/" "$unit"
-  sed -i -E "s/(remote )[0-9.]+ (ttl)/\\1${new_remote} \\2/" "$unit"
-
-  local backup="/root/gre-backup/gre${id}.service"
-  if [[ -f "$backup" ]]; then
-    add_log "Updating backup: $backup"
-    sed -i.bak -E "s/(ip tunnel add gre${id} mode gre local )[0-9.]+/\\1${new_local}/" "$backup"
-    sed -i -E "s/(remote )[0-9.]+ (ttl)/\\1${new_remote} \\2/" "$backup"
-  fi
-
-  # Update config file if exists
-  local conf
-  conf="$(sepehr_conf_path "$id")"
+  # Update or create config file
   if [[ -f "$conf" ]]; then
-    add_log "Updating config: $conf"
-    sed -i "s/^LOCAL_IPS=.*/LOCAL_IPS=\"${new_local}\"/" "$conf"
-    sed -i "s/^REMOTE_IPS=.*/REMOTE_IPS=\"${new_remote}\"/" "$conf"
+    sed -i "s/^LOCAL_IPS=.*/LOCAL_IPS=\"${new_local_ips}\"/" "$conf"
+    sed -i "s/^REMOTE_IPS=.*/REMOTE_IPS=\"${new_remote_ips}\"/" "$conf"
+    if grep -q '^TOTAL_PATHS=' "$conf"; then
+      sed -i "s/^TOTAL_PATHS=.*/TOTAL_PATHS=${total_paths}/" "$conf"
+    else
+      echo "TOTAL_PATHS=${total_paths}" >> "$conf"
+    fi
+    grep -q '^BLACKLIST=' "$conf" && sed -i 's/^BLACKLIST=.*/BLACKLIST=""/' "$conf" || echo 'BLACKLIST=""' >> "$conf"
+    sed -i '/^OFFSET=/d' "$conf"
     add_log "Config updated"
+  else
+    ensure_sepehr_conf_dir
+    cat >"$conf" <<EOF
+# Sepehr GRE${id} Configuration
+# Generated: $(date '+%Y-%m-%d %H:%M:%S')
+SIDE="${side}"
+LOCAL_IPS="${new_local_ips}"
+REMOTE_IPS="${new_remote_ips}"
+GRE_BASE="${gre_base}"
+MTU="${mtu}"
+TOTAL_PATHS=${total_paths}
+BLACKLIST=""
+FAIL_COUNT=0
+LAST_SUCCESS=$(date +%s)
+EOF
+    add_log "Config created"
   fi
 
-  add_log "Reloading systemd..."
-  systemctl daemon-reload >/dev/null 2>&1 || true
-
-  add_log "Restarting gre${id}.service..."
-  systemctl restart "gre${id}.service" >/dev/null 2>&1 || add_log "WARNING: restart failed"
+  # Run rotation to apply new IPs immediately
+  add_log "Running rotation..."
+  local rotator="/usr/local/bin/sepehr-recreate-gre${id}.sh"
+  if [[ -x "$rotator" ]]; then
+    "$rotator" >/dev/null 2>&1 && add_log "Rotation applied" || add_log "WARNING: Rotation failed"
+  else
+    create_auto_cron "$id" "$side" && add_log "Created rotation script"
+    [[ -x "$rotator" ]] && "$rotator" >/dev/null 2>&1
+  fi
 
   add_log "Done: GRE${id} IPs updated."
   render
+  echo "═══════════════════════════════════════════════════════"
   echo "GRE${id} Updated:"
-  echo "  Local : ${old_local} -> ${new_local}"
-  echo "  Remote: ${old_remote} -> ${new_remote}"
+  echo "  Local IPs  : ${new_local_ips}"
+  echo "  Remote IPs : ${new_remote_ips}"
+  echo "  Total Paths: ${total_paths}"
+  echo "═══════════════════════════════════════════════════════"
   echo
   show_unit_status_brief "gre${id}.service"
   pause_enter
