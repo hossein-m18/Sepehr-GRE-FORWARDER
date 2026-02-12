@@ -515,7 +515,7 @@ calculate_current_ips() {
     for b in "${blacklist[@]}"; do
       [[ "$b" == "$p" ]] && { is_blocked=1; break; }
     done
-    ((is_blocked == 0)) && ((active_count++))
+    ((is_blocked == 0)) && active_count=$((active_count + 1))
   done
 
   # If all paths are blacklisted, reset blacklist locally.
@@ -684,7 +684,7 @@ if [[ -f "$CONF" ]]; then
   # Count active paths
   active_count=0
   for ((p=0; p<total_paths; p++)); do
-    is_blacklisted "$p" || ((active_count++))
+    is_blacklisted "$p" || active_count=$((active_count + 1))
   done
 
   # If all paths blacklisted, reset blacklist
