@@ -1421,7 +1421,9 @@ uninstall_clean() {
     echo "  - /etc/systemd/system/sepehr-monitor-gre${id}.service (if exists)"
     echo "  - /etc/systemd/system/sepehr-monitor-gre${id}.timer (if exists)"
     echo "  - /etc/haproxy/conf.d/haproxy-gre${id}.cfg (if exists)"
+    echo "  - /etc/haproxy/conf.d/haproxy-gre${id}.cfg.bak (if exists)"
     echo "  - /etc/haproxy/conf.d/gre${id}.cfg (if exists)"
+    echo "  - /etc/haproxy/conf.d/gre${id}.cfg.bak (if exists)"
     echo "  - cron + /usr/local/bin/sepehr-recreate-gre${id}.sh (if exists)"
     echo "  - /var/log/sepehr-gre${id}.log (if exists)"
     echo "  - /usr/local/bin/sepehr-monitor-gre${id}.sh (if exists)"
@@ -1463,7 +1465,9 @@ uninstall_clean() {
 
   add_log "Removing HAProxy GRE config (if exists)..."
   rm -f "/etc/haproxy/conf.d/haproxy-gre${id}.cfg" >/dev/null 2>&1 || true
+  rm -f "/etc/haproxy/conf.d/haproxy-gre${id}.cfg.bak" >/dev/null 2>&1 || true
   rm -f "/etc/haproxy/conf.d/gre${id}.cfg" >/dev/null 2>&1 || true
+  rm -f "/etc/haproxy/conf.d/gre${id}.cfg.bak" >/dev/null 2>&1 || true
 
   add_log "Removing Sepehr config (if exists)..."
   rm -f "$(sepehr_conf_path "$id")" >/dev/null 2>&1 || true
@@ -1522,6 +1526,130 @@ uninstall_clean() {
 
   add_log "Uninstall completed for GRE${id}"
   render
+  pause_enter
+}
+
+full_uninstall_all() {
+  mapfile -t GRE_IDS < <(get_gre_ids)
+
+  while true; do
+    render
+    echo "╔═══════════════════════════════════════════════════════╗"
+    echo "║          ⚠️  FULL UNINSTALL - REMOVE ALL  ⚠️         ║"
+    echo "╚═══════════════════════════════════════════════════════╝"
+    echo
+    echo "This will PERMANENTLY remove:"
+    echo
+    echo "  GRE Tunnels:"
+    if ((${#GRE_IDS[@]} > 0)); then
+      local id
+      for id in "${GRE_IDS[@]}"; do
+        echo "    - gre${id}.service"
+      done
+    else
+      echo "    (none found)"
+    fi
+    echo
+    echo "  HAProxy:"
+    echo "    - ALL configs in /etc/haproxy/conf.d/ (*.cfg, *.bak)"
+    echo "    - /etc/haproxy/haproxy.cfg"
+    echo "    - HAProxy systemd override"
+    echo
+    echo "  Automation & Monitoring:"
+    echo "    - ALL sepehr cron jobs"
+    echo "    - ALL sepehr-recreate-gre*.sh scripts"
+    echo "    - ALL sepehr-monitor-gre*.sh scripts"
+    echo "    - ALL monitor services & timers"
+    echo
+    echo "  Config & Logs:"
+    echo "    - ALL files in /etc/sepehr/"
+    echo "    - ALL sepehr logs in /var/log/"
+    echo "    - ALL backups in /root/gre-backup/"
+    echo
+    echo "───────────────────────────────────────────────────────"
+    echo "Type: DESTROY (confirm)  or  NO (cancel)"
+    echo
+    local confirm=""
+    read -r -e -p "Confirm: " confirm
+    confirm="$(trim "$confirm")"
+
+    if [[ "$confirm" == "NO" || "$confirm" == "no" ]]; then
+      add_log "Full uninstall cancelled."
+      return 0
+    fi
+    if [[ "$confirm" == "DESTROY" ]]; then
+      break
+    fi
+    add_log "Please type DESTROY or NO."
+  done
+
+  add_log "Starting FULL UNINSTALL..."
+  render
+
+  # 1. Stop & remove all GRE services + monitors
+  local id
+  for id in "${GRE_IDS[@]}"; do
+    add_log "Removing GRE${id}..."
+    systemctl stop "gre${id}.service" >/dev/null 2>&1 || true
+    systemctl disable "gre${id}.service" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/gre${id}.service" >/dev/null 2>&1 || true
+
+    systemctl stop "sepehr-monitor-gre${id}.timer" >/dev/null 2>&1 || true
+    systemctl stop "sepehr-monitor-gre${id}.service" >/dev/null 2>&1 || true
+    systemctl disable "sepehr-monitor-gre${id}.timer" >/dev/null 2>&1 || true
+    systemctl disable "sepehr-monitor-gre${id}.service" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/sepehr-monitor-gre${id}.service" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/sepehr-monitor-gre${id}.timer" >/dev/null 2>&1 || true
+
+    remove_gre_automation_cron "$id"
+    rm -f "/usr/local/bin/sepehr-recreate-gre${id}.sh" >/dev/null 2>&1 || true
+    rm -f "/usr/local/bin/sepehr-monitor-gre${id}.sh" >/dev/null 2>&1 || true
+    rm -f "/var/log/sepehr-gre${id}.log" >/dev/null 2>&1 || true
+    rm -f "/var/log/sepehr-monitor-gre${id}.log" >/dev/null 2>&1 || true
+  done
+  add_log "All GRE services removed."
+
+  # 2. Remove ALL HAProxy configs (including .bak files)
+  add_log "Removing HAProxy configs..."
+  rm -f /etc/haproxy/conf.d/*.cfg >/dev/null 2>&1 || true
+  rm -f /etc/haproxy/conf.d/*.bak >/dev/null 2>&1 || true
+  rm -f /etc/haproxy/haproxy.cfg >/dev/null 2>&1 || true
+
+  # Remove HAProxy override
+  rm -rf /etc/systemd/system/haproxy.service.d >/dev/null 2>&1 || true
+  add_log "HAProxy configs removed."
+
+  # 3. Stop HAProxy (don't uninstall the package)
+  if haproxy_unit_exists; then
+    systemctl stop haproxy >/dev/null 2>&1 || true
+    systemctl disable haproxy >/dev/null 2>&1 || true
+    add_log "HAProxy stopped & disabled."
+  fi
+
+  # 4. Remove ALL Sepehr configs
+  add_log "Removing Sepehr configs..."
+  rm -rf /etc/sepehr >/dev/null 2>&1 || true
+  add_log "Sepehr configs removed."
+
+  # 5. Remove backups
+  add_log "Removing backups..."
+  rm -rf /root/gre-backup >/dev/null 2>&1 || true
+  add_log "Backups removed."
+
+  # 6. Reload systemd
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl reset-failed >/dev/null 2>&1 || true
+
+  add_log "FULL UNINSTALL COMPLETED!"
+  render
+  echo "╔═══════════════════════════════════════════════════════╗"
+  echo "║           ✅ Full Uninstall Complete!                 ║"
+  echo "╚═══════════════════════════════════════════════════════╝"
+  echo
+  echo "  All GRE tunnels, configs, monitors, and logs removed."
+  echo "  HAProxy package is still installed but disabled."
+  echo "  To also remove HAProxy: apt remove haproxy"
+  echo
   pause_enter
 }
 
@@ -2455,15 +2583,87 @@ fix_all_tunnels() {
   echo "Found ${#GRE_IDS[@]} tunnel(s): ${GRE_IDS[*]}"
   echo
   echo "This will:"
-  echo "  1. Reset BLACKLIST/FAIL_COUNT"
-  echo "  2. Rebuild rotation + monitor scripts with new code"
-  echo "  3. Detect/repair SIDE from current GRE local IP"
-  echo "  4. Apply new algorithm immediately (no wait for cron)"
-  echo "  5. Fix HAProxy configs (IRAN side only)"
+  echo "  1. Clean stale HAProxy configs (old .cfg/.bak files)"
+  echo "  2. Reset BLACKLIST/FAIL_COUNT"
+  echo "  3. Rebuild rotation + monitor scripts with new code"
+  echo "  4. Detect/repair SIDE from current GRE local IP"
+  echo "  5. Apply new algorithm immediately (no wait for cron)"
+  echo "  6. Fix HAProxy configs (IRAN side only)"
+  echo "  7. Restart & verify all active tunnels"
   echo
   read -r -p "Continue? (y/n): " confirm
   [[ "${confirm,,}" != "y" ]] && return 0
 
+  # ── PHASE 0: Clean stale HAProxy configs ──────────────────────────
+  add_log "Cleaning stale HAProxy configs..."
+  render
+  local stale_removed=0
+  if [[ -d /etc/haproxy/conf.d ]]; then
+    local f fname gre_num
+    for f in /etc/haproxy/conf.d/haproxy-gre*.cfg /etc/haproxy/conf.d/haproxy-gre*.cfg.bak \
+             /etc/haproxy/conf.d/gre*.cfg /etc/haproxy/conf.d/gre*.cfg.bak; do
+      [[ -f "$f" ]] || continue
+      fname="$(basename "$f")"
+      # Extract GRE number from filename (haproxy-gre1234.cfg or gre1234.cfg or .bak)
+      gre_num=""
+      if [[ "$fname" =~ ^haproxy-gre([0-9]+)\.cfg ]]; then
+        gre_num="${BASH_REMATCH[1]}"
+      elif [[ "$fname" =~ ^gre([0-9]+)\.cfg ]]; then
+        gre_num="${BASH_REMATCH[1]}"
+      fi
+      [[ -z "$gre_num" ]] && continue
+
+      # Check if this GRE still has a service
+      local is_active=0
+      local id
+      for id in "${GRE_IDS[@]}"; do
+        [[ "$id" == "$gre_num" ]] && { is_active=1; break; }
+      done
+
+      if ((is_active == 0)); then
+        rm -f "$f" >/dev/null 2>&1 || true
+        add_log "  Removed stale: $fname (GRE${gre_num} no longer exists)"
+        ((stale_removed++))
+      elif [[ "$fname" == *.bak ]]; then
+        # Remove .bak even for active tunnels (they're leftovers from sed -i)
+        rm -f "$f" >/dev/null 2>&1 || true
+        add_log "  Removed .bak: $fname"
+        ((stale_removed++))
+      fi
+    done
+  fi
+  ((stale_removed > 0)) && add_log "Cleaned ${stale_removed} stale file(s)" || add_log "No stale configs found"
+
+  # Also remove stale cron/scripts/monitors for non-existent tunnels
+  local stale_script
+  for stale_script in /usr/local/bin/sepehr-recreate-gre*.sh /usr/local/bin/sepehr-monitor-gre*.sh; do
+    [[ -f "$stale_script" ]] || continue
+    local sname gnum
+    sname="$(basename "$stale_script")"
+    gnum=""
+    if [[ "$sname" =~ gre([0-9]+) ]]; then
+      gnum="${BASH_REMATCH[1]}"
+    fi
+    [[ -z "$gnum" ]] && continue
+    local found=0
+    for id in "${GRE_IDS[@]}"; do
+      [[ "$id" == "$gnum" ]] && { found=1; break; }
+    done
+    if ((found == 0)); then
+      rm -f "$stale_script" >/dev/null 2>&1 || true
+      remove_gre_automation_cron "$gnum"
+      # Stop stale monitors
+      systemctl stop "sepehr-monitor-gre${gnum}.timer" >/dev/null 2>&1 || true
+      systemctl stop "sepehr-monitor-gre${gnum}.service" >/dev/null 2>&1 || true
+      systemctl disable "sepehr-monitor-gre${gnum}.timer" >/dev/null 2>&1 || true
+      systemctl disable "sepehr-monitor-gre${gnum}.service" >/dev/null 2>&1 || true
+      rm -f "/etc/systemd/system/sepehr-monitor-gre${gnum}.service" >/dev/null 2>&1 || true
+      rm -f "/etc/systemd/system/sepehr-monitor-gre${gnum}.timer" >/dev/null 2>&1 || true
+      add_log "  Removed stale automation for GRE${gnum}"
+    fi
+  done
+
+  # ── PHASE 1-5: Fix each active tunnel ─────────────────────────────
   local id conf side unit unit_gre_ip unit_last rotator hap_cfg_guess
   for id in "${GRE_IDS[@]}"; do
     conf="$(sepehr_conf_path "$id")"
@@ -2547,16 +2747,45 @@ fix_all_tunnels() {
         fi
       fi
 
-      add_log "  ✓ GRE${id} fixed"
+      # 6. Restart tunnel and verify it's active
+      add_log "  Restarting gre${id}.service..."
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      systemctl restart "gre${id}.service" >/dev/null 2>&1
+      sleep 1
+      if systemctl is-active --quiet "gre${id}.service" 2>/dev/null; then
+        add_log "  ✓ GRE${id} is ACTIVE"
+      else
+        add_log "  ✗ GRE${id} FAILED to start!"
+        systemctl status "gre${id}.service" --no-pager 2>&1 | tail -3 | while read -r line; do
+          add_log "    $line"
+        done
+      fi
     else
       add_log "  ✗ Config not found for GRE${id}"
     fi
   done
 
-  # Restart HAProxy if any IRAN side
-  if systemctl is-active haproxy >/dev/null 2>&1; then
-    systemctl restart haproxy 2>/dev/null || true
-    add_log "HAProxy restarted"
+  # ── PHASE FINAL: Restart HAProxy ──────────────────────────────────
+  if haproxy_unit_exists; then
+    add_log "Validating HAProxy config..."
+    if command -v haproxy >/dev/null 2>&1; then
+      if haproxy -c -f /etc/haproxy/haproxy.cfg -f /etc/haproxy/conf.d/ >/dev/null 2>&1; then
+        add_log "HAProxy config OK"
+        systemctl restart haproxy >/dev/null 2>&1 || true
+        sleep 1
+        if systemctl is-active --quiet haproxy 2>/dev/null; then
+          add_log "✓ HAProxy is ACTIVE"
+        else
+          add_log "✗ HAProxy FAILED to start!"
+        fi
+      else
+        add_log "✗ HAProxy config validation FAILED!"
+        add_log "  Run: haproxy -c -f /etc/haproxy/haproxy.cfg -f /etc/haproxy/conf.d/"
+      fi
+    else
+      systemctl restart haproxy 2>/dev/null || true
+      add_log "HAProxy restarted (no validation)"
+    fi
   fi
 
   echo
@@ -2572,7 +2801,7 @@ main_menu() {
     echo "1 > IRAN SETUP"
     echo "2 > KHAREJ SETUP"
     echo "3 > Services ManageMent"
-    echo "4 > Unistall & Clean"
+    echo "4 > Uninstall & Clean (Single)"
     echo "5 > ADD TUNNEL PORT"
     echo "6 > Rebuild Automation"
     echo "7 > Regenerate Automation"
@@ -2581,6 +2810,7 @@ main_menu() {
     echo "10> View IP State"
     echo "11> Setup Monitor (Self-Healing)"
     echo "12> Fix All Tunnels (Update Scripts)"
+    echo "13> ⚠️  Full Uninstall ALL"
     echo "0 > Exit"
     echo
     read -r -e -p "Select option: " choice
@@ -2590,7 +2820,7 @@ main_menu() {
       1) add_log "Selected: IRAN SETUP"; iran_setup ;;
       2) add_log "Selected: KHAREJ SETUP"; kharej_setup ;;
       3) add_log "Selected: Services ManageMent"; services_management ;;
-      4) add_log "Selected: Unistall & Clean"; uninstall_clean ;;
+      4) add_log "Selected: Uninstall & Clean"; uninstall_clean ;;
       5) add_log "Selected: add tunnel port"; add_tunnel_port ;;
       6) add_log "Selected: Rebuild Automation"; recreate_automation_mode ;;
       7) add_log "Selected: Regenerate Automation"; recreate_automation ;;
@@ -2599,6 +2829,7 @@ main_menu() {
       10) add_log "Selected: View IP State"; view_ip_state ;;
       11) add_log "Selected: Setup Monitor"; setup_monitor ;;
       12) add_log "Selected: Fix All Tunnels"; fix_all_tunnels ;;
+      13) add_log "Selected: Full Uninstall ALL"; full_uninstall_all ;;
       0) add_log "Bye!"; render; exit 0 ;;
       *) add_log "Invalid option: $choice" ;;
     esac
