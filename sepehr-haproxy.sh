@@ -2765,7 +2765,35 @@ fix_all_tunnels() {
     fi
   done
 
-  # ── PHASE FINAL: Restart HAProxy ──────────────────────────────────
+  # ── PHASE FINAL: Cleanup .bak and Restart HAProxy ──────────────────
+  # Clean ALL .bak files one final time (old rotator may have recreated them)
+  add_log "Final cleanup: removing all .bak files..."
+  rm -f /etc/haproxy/conf.d/*.bak >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/gre*.service.bak >/dev/null 2>&1 || true
+
+  # Also clean stale Sepehr configs for non-existent tunnels
+  if [[ -d /etc/sepehr ]]; then
+    local cf
+    for cf in /etc/sepehr/gre*.conf; do
+      [[ -f "$cf" ]] || continue
+      local cfname gnum2
+      cfname="$(basename "$cf")"
+      gnum2=""
+      [[ "$cfname" =~ ^gre([0-9]+)\.conf$ ]] && gnum2="${BASH_REMATCH[1]}"
+      [[ -z "$gnum2" ]] && continue
+      local found2=0
+      for id in "${GRE_IDS[@]}"; do
+        [[ "$id" == "$gnum2" ]] && { found2=1; break; }
+      done
+      if ((found2 == 0)); then
+        rm -f "$cf" >/dev/null 2>&1 || true
+        add_log "  Removed stale config: $cfname"
+      fi
+    done
+  fi
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+
   if haproxy_unit_exists; then
     add_log "Validating HAProxy config..."
     if command -v haproxy >/dev/null 2>&1; then
