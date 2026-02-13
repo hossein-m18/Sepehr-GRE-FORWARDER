@@ -2794,6 +2794,35 @@ fix_all_tunnels() {
 
   systemctl daemon-reload >/dev/null 2>&1 || true
 
+  # Kill stale socat processes (leftovers from old tunnel setups)
+  if command -v socat >/dev/null 2>&1 || pgrep -x socat >/dev/null 2>&1; then
+    local socat_count
+    socat_count=$(pgrep -cx socat 2>/dev/null || echo 0)
+    if ((socat_count > 0)); then
+      killall socat >/dev/null 2>&1 || true
+      add_log "Killed ${socat_count} stale socat process(es)"
+      sleep 1
+    fi
+  fi
+
+  # Kill any process blocking HAProxy ports
+  if [[ -d /etc/haproxy/conf.d ]]; then
+    local port pid_line block_pid block_proc
+    while IFS= read -r port; do
+      [[ -z "$port" ]] && continue
+      pid_line=$(ss -tlnp 2>/dev/null | grep ":${port} " | grep -v haproxy | head -n1)
+      if [[ -n "$pid_line" ]]; then
+        block_pid=$(echo "$pid_line" | grep -oP 'pid=\K[0-9]+' | head -n1)
+        block_proc=$(echo "$pid_line" | grep -oP '"[^"]+"' | head -n1)
+        if [[ -n "$block_pid" ]]; then
+          kill -9 "$block_pid" >/dev/null 2>&1 || true
+          add_log "Killed blocking process on port ${port}: ${block_proc} (PID ${block_pid})"
+        fi
+      fi
+    done < <(grep -rh 'bind ' /etc/haproxy/conf.d/ 2>/dev/null | grep -oP ':\K[0-9]+' | sort -u)
+    sleep 1
+  fi
+
   if haproxy_unit_exists; then
     add_log "Validating HAProxy config..."
     if command -v haproxy >/dev/null 2>&1; then
