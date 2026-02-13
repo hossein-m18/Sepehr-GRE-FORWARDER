@@ -251,7 +251,7 @@ for ID in "${GRE_IDS[@]}"; do
 
   # ── .bak files ──
   log "\n  ${YELLOW}[STALE .BAK FILES]${NC}"
-  local bak_found=0
+  bak_found=0
   for bak in /etc/haproxy/conf.d/*gre${ID}*.bak /etc/systemd/system/gre${ID}.service.bak; do
     if [[ -f "$bak" ]]; then
       fail "Stale .bak found: $bak"
@@ -263,7 +263,7 @@ for ID in "${GRE_IDS[@]}"; do
   # ── Port conflicts ──
   log "\n  ${YELLOW}[PORT CONFLICTS]${NC}"
   if [[ -f "$HAP_CFG" ]]; then
-    local conflict=0
+    conflict=0
     while IFS= read -r port; do
       [[ -z "$port" ]] && continue
       blocker=$(ss -tlnp 2>/dev/null | grep ":${port} " | grep -v haproxy || true)
