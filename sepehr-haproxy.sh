@@ -2795,14 +2795,10 @@ fix_all_tunnels() {
   systemctl daemon-reload >/dev/null 2>&1 || true
 
   # Kill stale socat processes (leftovers from old tunnel setups)
-  if command -v socat >/dev/null 2>&1 || pgrep -x socat >/dev/null 2>&1; then
-    local socat_count
-    socat_count=$(pgrep -cx socat 2>/dev/null || echo 0)
-    if ((socat_count > 0)); then
-      killall socat >/dev/null 2>&1 || true
-      add_log "Killed ${socat_count} stale socat process(es)"
-      sleep 1
-    fi
+  if pgrep -x socat >/dev/null 2>&1; then
+    killall socat >/dev/null 2>&1 || true
+    add_log "Killed stale socat process(es)"
+    sleep 1
   fi
 
   # Kill any process blocking HAProxy ports
