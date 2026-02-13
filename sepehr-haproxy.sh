@@ -785,12 +785,12 @@ if [[ -n "${GRE_BASE:-}" ]]; then
   old_gre_ip=$(grep -oP 'ip addr add \K([0-9.]+)' "$UNIT" | head -n1 || true)
   log "GRE INTERNAL IP: $old_gre_ip -> $new_gre_ip (base=$GRE_BASE)"
 
-  sed -i.bak -E "s/ip addr add [0-9.]+\/30/ip addr add ${new_gre_ip}\/30/" "$UNIT"
+  sed -i -E "s/ip addr add [0-9.]+\/30/ip addr add ${new_gre_ip}\/30/" "$UNIT"
 
   # Update HAProxy if IRAN side - use PEER IP (.2)
   if [[ "$SIDE" == "IRAN" && -f "$HAP_CFG" ]]; then
     peer_gre_ip="${new_gre_ip%.*}.2"
-    sed -i.bak -E "s/(server[[:space:]]+gre${ID}_b_[0-9]+[[:space:]]+)[0-9.]+(:[0-9]+[[:space:]]+check)/\1${peer_gre_ip}\2/g" "$HAP_CFG"
+    sed -i -E "s/(server[[:space:]]+gre${ID}_b_[0-9]+[[:space:]]+)[0-9.]+(:[0-9]+[[:space:]]+check)/\1${peer_gre_ip}\2/g" "$HAP_CFG"
     log "HAProxy config updated with peer GRE IP: $peer_gre_ip"
   fi
 fi
@@ -885,13 +885,13 @@ ensure_mtu_line_in_unit() {
   [[ -f "$file" ]] || return 0
 
   if grep -qE "^ExecStart=/sbin/ip link set gre${id} mtu[[:space:]]+[0-9]+$" "$file"; then
-    sed -i.bak -E "s|^ExecStart=/sbin/ip link set gre${id} mtu[[:space:]]+[0-9]+$|ExecStart=/sbin/ip link set gre${id} mtu ${mtu}|" "$file"
+    sed -i -E "s|^ExecStart=/sbin/ip link set gre${id} mtu[[:space:]]+[0-9]+$|ExecStart=/sbin/ip link set gre${id} mtu ${mtu}|" "$file"
     add_log "Updated MTU line in: $file"
     return 0
   fi
 
   if grep -qE "^ExecStart=/sbin/ip link set gre${id} up$" "$file"; then
-    sed -i.bak -E "s|^ExecStart=/sbin/ip link set gre${id} up$|ExecStart=/sbin/ip link set gre${id} mtu ${mtu}\nExecStart=/sbin/ip link set gre${id} up|" "$file"
+    sed -i -E "s|^ExecStart=/sbin/ip link set gre${id} up$|ExecStart=/sbin/ip link set gre${id} mtu ${mtu}\nExecStart=/sbin/ip link set gre${id} up|" "$file"
     add_log "Inserted MTU line in: $file"
     return 0
   fi
