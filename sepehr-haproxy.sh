@@ -836,13 +836,34 @@ fi
 sleep 1
 
 if [[ "$SIDE" == "IRAN" ]]; then
+  # Kill stale socat and processes blocking HAProxy ports
+  killall socat 2>/dev/null || true
+  rm -f /etc/haproxy/conf.d/*.bak 2>/dev/null || true
+
+  # Kill any process blocking HAProxy ports
+  if [[ -f "$HAP_CFG" ]]; then
+    while IFS= read -r bport; do
+      [[ -z "$bport" ]] && continue
+      bpid=$(ss -tlnp 2>/dev/null | grep ":${bport} " | grep -v haproxy | grep -oP 'pid=\K[0-9]+' | head -n1)
+      if [[ -n "$bpid" ]]; then
+        kill -9 "$bpid" 2>/dev/null || true
+        log "Killed blocking PID $bpid on port $bport"
+      fi
+    done < <(grep -oP 'bind\s+\S+:\K[0-9]+' "$HAP_CFG" 2>/dev/null)
+    sleep 1
+  fi
+
   if command -v haproxy >/dev/null 2>&1; then
     haproxy -c -f /etc/haproxy/haproxy.cfg -f /etc/haproxy/conf.d/ >/dev/null 2>&1 || {
       log "ERROR: HAProxy config validation failed"; exit 1;
     }
   fi
   systemctl restart haproxy >/dev/null 2>&1 || log "WARNING: HAProxy restart failed"
-  log "HAProxy restarted"
+  if systemctl is-active --quiet haproxy 2>/dev/null; then
+    log "HAProxy restarted OK"
+  else
+    log "ERROR: HAProxy failed to start after rotation!"
+  fi
 fi
 
 log "Rotation complete | GRE${ID} | SIDE=$SIDE"
