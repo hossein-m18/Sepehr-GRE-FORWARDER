@@ -796,10 +796,44 @@ if [[ -n "${GRE_BASE:-}" ]]; then
 fi
 
 # ============================================
-# PART 3: Restart services
+# PART 3: Restart services with verification
 # ============================================
 systemctl daemon-reload >/dev/null 2>&1 || true
-systemctl restart "gre${ID}.service" >/dev/null 2>&1 || true
+
+# Manually tear down old tunnel first to avoid kernel conflicts
+/sbin/ip link set "gre${ID}" down 2>/dev/null || true
+/sbin/ip tunnel del "gre${ID}" 2>/dev/null || true
+sleep 1
+
+# Restart with retry
+restart_ok=0
+for attempt in 1 2 3; do
+  if systemctl restart "gre${ID}.service" 2>&1; then
+    sleep 1
+    # Verify tunnel is actually up
+    if ip link show "gre${ID}" 2>/dev/null | grep -q "UP"; then
+      live_ip=$(ip -4 -o addr show dev "gre${ID}" 2>/dev/null | awk '{print $4}' | head -n1)
+      log "GRE${ID} UP (attempt $attempt) | IP: $live_ip"
+      restart_ok=1
+      break
+    else
+      log "WARNING: gre${ID} not UP after restart (attempt $attempt)"
+    fi
+  else
+    log "WARNING: systemctl restart failed (attempt $attempt)"
+  fi
+  # Teardown and retry
+  /sbin/ip link set "gre${ID}" down 2>/dev/null || true
+  /sbin/ip tunnel del "gre${ID}" 2>/dev/null || true
+  sleep 2
+done
+
+if ((restart_ok == 0)); then
+  log "ERROR: gre${ID} failed to start after 3 attempts!"
+fi
+
+# Wait for tunnel to stabilize before HAProxy
+sleep 1
 
 if [[ "$SIDE" == "IRAN" ]]; then
   if command -v haproxy >/dev/null 2>&1; then
@@ -807,7 +841,7 @@ if [[ "$SIDE" == "IRAN" ]]; then
       log "ERROR: HAProxy config validation failed"; exit 1;
     }
   fi
-  systemctl restart haproxy >/dev/null 2>&1 || true
+  systemctl restart haproxy >/dev/null 2>&1 || log "WARNING: HAProxy restart failed"
   log "HAProxy restarted"
 fi
 
