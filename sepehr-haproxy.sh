@@ -341,18 +341,32 @@ ask_multiple_local_ips() {
     fi
 
     if [[ "$choice" == "0" ]]; then
-      local manual_ip
-      ask_until_valid "Enter IP manually:" valid_ipv4 manual_ip
-      local exists=0
-      for sel in "${SELECTED_IPS[@]}"; do
-        [[ "$sel" == "$manual_ip" ]] && exists=1
+      local manual_input
+      render
+      echo "Enter IP(s) manually (comma/space separated):"
+      echo "Example: 1.2.3.4,5.6.7.8 or 1.2.3.4 5.6.7.8"
+      echo
+      read -r -e -p "IP(s): " manual_input
+      manual_input="$(trim "$manual_input")"
+      local mip
+      for mip in $(echo "$manual_input" | tr ',' ' '); do
+        mip="$(trim "$mip")"
+        [[ -z "$mip" ]] && continue
+        if valid_ipv4 "$mip"; then
+          local exists=0
+          for sel in "${SELECTED_IPS[@]}"; do
+            [[ "$sel" == "$mip" ]] && exists=1
+          done
+          if ((exists == 0)); then
+            SELECTED_IPS+=("$mip")
+            add_log "Added (manual): $mip"
+          else
+            add_log "Already selected: $mip"
+          fi
+        else
+          add_log "Invalid IP: $mip"
+        fi
       done
-      if ((exists == 0)); then
-        SELECTED_IPS+=("$manual_ip")
-        add_log "Added (manual): $manual_ip"
-      else
-        add_log "Already selected: $manual_ip"
-      fi
       continue
     fi
 
@@ -394,13 +408,14 @@ ask_remote_ips() {
   while true; do
     render
     echo "$prompt"
-    echo "(Enter IPs one by one, 'd' when done)"
+    echo "(Enter IPs - comma/space separated, 'd' when done)"
+    echo "Example: 1.2.3.4,5.6.7.8 or 1.2.3.4 5.6.7.8"
     echo
     echo "Current list: ${REMOTE_IPS[*]:-none}"
     echo
 
     local input
-    read -r -e -p "Enter IP (or 'd'): " input
+    read -r -e -p "Enter IP(s) (or 'd'): " input
     input="$(trim "$input")"
 
     if [[ "${input,,}" == "d" || "${input,,}" == "done" ]]; then
@@ -411,20 +426,26 @@ ask_remote_ips() {
       break
     fi
 
-    if valid_ipv4 "$input"; then
-      local exists=0
-      for r in "${REMOTE_IPS[@]}"; do
-        [[ "$r" == "$input" ]] && exists=1
-      done
-      if ((exists == 0)); then
-        REMOTE_IPS+=("$input")
-        add_log "Added remote: $input"
+    # Split by comma and/or space
+    local ip
+    for ip in $(echo "$input" | tr ',' ' '); do
+      ip="$(trim "$ip")"
+      [[ -z "$ip" ]] && continue
+      if valid_ipv4 "$ip"; then
+        local exists=0
+        for r in "${REMOTE_IPS[@]}"; do
+          [[ "$r" == "$ip" ]] && exists=1
+        done
+        if ((exists == 0)); then
+          REMOTE_IPS+=("$ip")
+          add_log "Added remote: $ip"
+        else
+          add_log "Already exists: $ip"
+        fi
       else
-        add_log "Already exists: $input"
+        add_log "Invalid IP: $ip"
       fi
-    else
-      add_log "Invalid IP: $input"
-    fi
+    done
   done
 
   local result
